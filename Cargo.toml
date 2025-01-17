@@ -1,0 +1,10 @@
+[package]
+name = "aris"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.95"
+bytes = "1.9.0"
+crossbeam = { version = "0.8.4", features = ["crossbeam-epoch"] }
+thiserror = "2.0.11"
