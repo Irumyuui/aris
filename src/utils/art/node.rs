@@ -216,3 +216,60 @@ impl NodePtr {
 }
 
 /* #endregion Drop node */
+
+#[cfg(test)]
+mod tests {
+    #![allow(static_mut_refs)]
+
+    use std::{ptr::NonNull, sync::atomic::AtomicU64};
+
+    use crate::utils::art::node::{IntenalNode, NodeType};
+
+    #[test]
+    fn muil_threads() {
+        const ONECE: usize = 10000;
+        const THREADS: usize = 20;
+
+        static mut NODE: Option<IntenalNode> = None;
+        unsafe {
+            NODE = Some(IntenalNode {
+                version: AtomicU64::new(0),
+                prefix_len: 0,
+                prefix: Default::default(),
+                num_children: Default::default(),
+                node_type: NodeType::Node4,
+            });
+        }
+
+        let ths = (0..THREADS)
+            .map(|_| {
+                std::thread::spawn(|| unsafe {
+                    for _ in 0..ONECE {
+                        'retry: loop {
+                            let node = NODE.as_mut().unwrap() as *mut _;
+                            match IntenalNode::write(NonNull::new_unchecked(node)) {
+                                Ok(mut g) => {
+                                    g.as_mut().prefix_len += 1;
+                                    break 'retry;
+                                }
+                                Err(_) => continue 'retry,
+                            }
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        ths.into_iter().try_for_each(|th| th.join()).unwrap();
+
+        unsafe {
+            // Reader only needs to see the appropriate state and verify that it is in the correct state.
+            let reader =
+                IntenalNode::read(NonNull::new_unchecked(NODE.as_mut().unwrap() as *mut _))
+                    .unwrap();
+
+            assert_eq!(reader.as_ref().prefix_len, ONECE * THREADS);
+            reader.unlock().unwrap();
+        }
+    }
+}
