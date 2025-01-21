@@ -9,7 +9,7 @@ pub(crate) type LeafPtr = NonNull<LeafNode>;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum NodePtr {
     Intenal { ptr: IntenalPtr },
-    Leaf { ptr: IntenalPtr },
+    Leaf { ptr: LeafPtr },
     None,
 }
 
@@ -40,13 +40,63 @@ pub(crate) struct IntenalNode {
 
 impl IntenalNode {
     pub(crate) const PREFIX_SIZE: usize = 10;
+
+    pub(crate) fn insert_child(node: NonNull<IntenalNode>, key: u8, child: NodePtr) {
+        todo!()
+    }
 }
 
 // Some action like `&IntenalNode`
-impl ReadGuard<'_> {}
+impl ReadGuard<'_> {
+    pub(crate) fn prefix_matches(&self, key: &[u8]) -> Result<usize, ArtOptLockError> {
+        self.check_version()?;
+        todo!()
+    }
+
+    pub(crate) fn prefix_len(&self) -> usize {
+        self.as_ref().prefix_len
+    }
+
+    pub(crate) fn get_child(&self, key: u8) -> Result<NodePtr, ArtOptLockError> {
+        self.check_version()?;
+        todo!()
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        todo!()
+    }
+}
 
 // Some action like `&mut IntenalNode`
-impl WriteGuard<'_> {}
+impl<'a> WriteGuard<'a> {
+    pub(crate) fn replace_child(&mut self, key: u8, child: NodePtr) {
+        todo!()
+    }
+
+    pub(crate) fn insert_child(&mut self, key: u8, child: NodePtr) {
+        todo!()
+    }
+
+    pub(crate) fn insert_split_prefix(
+        &mut self,
+        split_node_pos: u8,
+        split_node: WriteGuard<'a>,
+        key: Bytes,
+        value: Bytes,
+        depth: usize,
+        prefix_len: usize,
+    ) {
+        todo!()
+    }
+
+    pub(crate) fn grow(&mut self) -> NonNull<IntenalNode> {
+        todo!()
+    }
+
+    pub(crate) unsafe fn defer_drop(&mut self, guard: &Guard) {
+        todo!()
+    }
+}
 
 #[repr(C)]
 #[repr(align(64))]
@@ -74,6 +124,31 @@ struct Node28 {
 struct Node256 {
     base: IntenalNode,
     children: [NodePtr; 256],
+}
+
+impl LeafNode {
+    pub(crate) fn key(&self) -> &Bytes {
+        &self.key
+    }
+
+    pub(crate) fn value(&self) -> &Bytes {
+        &self.value
+    }
+
+    pub(crate) fn prefix_matches(&self, key: impl AsRef<[u8]>, depth: usize) -> usize {
+        let key = key.as_ref();
+
+        let mut l = depth;
+
+        while l < key.len() && l < self.key.len() {
+            if key[l] != self.key[l] {
+                break;
+            }
+            l += 1;
+        }
+
+        l - depth
+    }
 }
 
 /* #region Optimistic lock implementation */
