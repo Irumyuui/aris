@@ -28,7 +28,7 @@ impl Arena {
 
     pub(crate) unsafe fn alloc_unaligned(&mut self, bytes: usize) -> *mut u8 {
         if bytes > BLOCK_SIZE / 4 {
-            let layout = Layout::from_size_align(bytes, Layout::new::<usize>().align()).unwrap();
+            let layout = Layout::array::<u8>(bytes).unwrap();
             let result = self.alloc_new_block(layout);
             return result;
         }
@@ -52,10 +52,7 @@ impl Arena {
         let total_bytes = null_bytes + size;
 
         if total_bytes <= self.remain_bytes {
-            let result = self.cur_block_ptr.wrapping_byte_add(null_bytes);
-            self.cur_block_ptr = self.cur_block_ptr.wrapping_byte_add(total_bytes);
-            self.remain_bytes -= total_bytes;
-            return result;
+            return self.advance_ptr(null_bytes, total_bytes);
         }
 
         if total_bytes > BLOCK_SIZE / 4 {
@@ -66,12 +63,14 @@ impl Arena {
         // block not enoght..
         self.cur_block_ptr = self.alloc_new_block(NEW_BLOCK_LAYOUT);
         self.remain_bytes = BLOCK_SIZE;
+        self.advance_ptr(null_bytes, total_bytes)
+    }
 
+    fn advance_ptr(&mut self, null_bytes: usize, total_bytes: usize) -> *mut u8 {
         assert!(total_bytes <= self.remain_bytes);
         let result = self.cur_block_ptr.wrapping_byte_add(null_bytes);
         self.cur_block_ptr = self.cur_block_ptr.wrapping_byte_add(total_bytes);
         self.remain_bytes -= total_bytes;
-
         result
     }
 
