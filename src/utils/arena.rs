@@ -25,6 +25,8 @@ pub struct BlockArena {
     inner: RefCell<InternalBlockArena>,
 }
 
+unsafe impl Sync for BlockArena {}
+
 impl BlockArena {
     pub fn new() -> Self {
         Self {
