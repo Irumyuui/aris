@@ -157,7 +157,7 @@ where
     }
 
     // TODO: maybe insert need just `&self`?
-    pub fn insert(&mut self, key: impl Into<Bytes>) {
+    pub fn insert(&self, key: impl Into<Bytes>) {
         let key = key.into();
         let mut pref = [&*self.head as *const _; MAX_HEIGHT];
 
@@ -378,7 +378,7 @@ mod tests {
             left.cmp(right)
         }
 
-        fn id(&self) -> &str {
+        fn name(&self) -> &str {
             unimplemented!()
         }
     }

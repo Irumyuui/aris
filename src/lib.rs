@@ -1,6 +1,7 @@
 use mimalloc::MiMalloc;
 
 mod memtable;
+mod sstable;
 
 mod db;
 mod utils;
