@@ -22,3 +22,6 @@ tokio = { version = "1.43.0", features = ["full"] }
 fast-async-mutex = "0.6.7"
 crc32fast = "1.4.2"
 rio = "0.9.4"
+
+[dev-dependencies]
+tempfile = "3.15.0"

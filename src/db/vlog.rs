@@ -48,6 +48,10 @@ impl ValueLogRecord {
         let crc = crc32fast::hash(&buf[..]);
         buf.put_u32(crc);
 
+        tracing::debug!("key_len: {:?}, value_len: {:?}", key_len, value_len);
+        tracing::debug!("key: {:?}, value: {:?}", self.key, self.value);
+        tracing::debug!("crc32: {}", crc);
+
         buf.freeze()
     }
 }
@@ -55,6 +59,7 @@ impl ValueLogRecord {
 pub struct ValueLogReader {
     ring: rio::Rio,
     file: std::fs::File,
+    offset: u64,
 }
 
 impl ValueLogReader {
@@ -71,30 +76,39 @@ impl ValueLogReader {
             .create(false)
             .open(path)?;
 
-        Ok(Self { ring, file })
+        Ok(Self {
+            ring,
+            file,
+            offset: 0,
+        })
     }
 
-    pub async fn read_record(&self) -> Result<ValueLogRecord> {
+    pub async fn read_record(&mut self) -> Result<ValueLogRecord> {
         let mut buf = BytesMut::zeroed(1);
 
-        let read_size = self.ring.read_at(&self.file, &mut buf, 0).await?;
-        if read_size != 1 {
+        let read_len = self.ring.read_at(&self.file, &mut buf, self.offset).await?;
+        if read_len != 1 {
             return Err(Error::ValueLogFileCorrupted("Read data len failed".into()));
         }
 
         let data_len = buf[0] as usize;
+        tracing::debug!("read_len: {} data_len: {}", read_len, data_len);
 
         buf.resize(buf.len() + data_len, 0);
 
         let size_buf = &mut buf[1..];
-        let read_size = self.ring.read_at(&self.file, &size_buf, 1).await?;
-        if read_size != data_len {
+        let key_value_len = self
+            .ring
+            .read_at(&self.file, &size_buf, 1 + self.offset)
+            .await?;
+        if key_value_len != data_len {
             return Err(Error::ValueLogFileCorrupted("Read data failed".into()));
         }
+        tracing::debug!("key_len + value_len: {}", key_value_len);
 
-        let var_key_len = VarUInt::try_from(&buf[..])
+        let var_key_len = VarUInt::try_from(&buf[1..])
             .map_err(|e| Error::ValueLogFileCorrupted(format!("Parse key len failed: {}", e)))?;
-        let var_value_len = VarUInt::try_from(&buf[var_key_len.as_slice().len()..])
+        let var_value_len = VarUInt::try_from(&buf[1 + var_key_len.as_slice().len()..])
             .map_err(|e| Error::ValueLogFileCorrupted(format!("Parse value len failed: {}", e)))?;
 
         let key_len = var_key_len.try_to_u64().map_err(|e| {
@@ -111,14 +125,18 @@ impl ValueLogReader {
 
         let (value_buf, crc_buf) = value_buf.split_at_mut(value_len as usize);
 
-        let read_key_req = self.ring.read_at(&self.file, &key_buf, 1 + data_len as u64);
-        let read_value_req =
+        let read_key_req =
             self.ring
-                .read_at(&self.file, &value_buf, 1 + data_len as u64 + key_len as u64);
+                .read_at(&self.file, &key_buf, 1 + data_len as u64 + self.offset);
+        let read_value_req = self.ring.read_at(
+            &self.file,
+            &value_buf,
+            1 + data_len as u64 + key_len as u64 + self.offset,
+        );
         let read_crc_req = self.ring.read_at(
             &self.file,
             &crc_buf,
-            1 + data_len as u64 + key_len as u64 + value_len as u64,
+            1 + data_len as u64 + key_len as u64 + value_len as u64 + self.offset,
         );
 
         if read_key_req.await? != key_len as usize {
@@ -136,7 +154,10 @@ impl ValueLogReader {
         let crc = crc32fast::hash(&buf[..buf.len() - 4]);
 
         if read_crc != crc {
-            return Err(Error::ValueLogFileCorrupted("CRC32 checksum failed".into()));
+            return Err(Error::ValueLogFileCorrupted(format!(
+                "CRC32 checksum failed, read: {}, calc: {}",
+                read_crc, crc
+            )));
         }
 
         let key = buf.slice((1 + data_len as usize)..(1 + data_len as usize + key_len as usize));
@@ -145,6 +166,8 @@ impl ValueLogReader {
                 ..(1 + data_len as usize + key_len as usize + value_len as usize),
         );
 
+        self.offset += 1 + data_len as u64 + key_len as u64 + value_len as u64 + 4;
+
         return Ok(ValueLogRecord { key, value });
     }
 }
@@ -152,6 +175,10 @@ impl ValueLogReader {
 #[cfg(test)]
 mod tests {
     use bytes::{Buf, BufMut, Bytes, BytesMut};
+    use itertools::Itertools;
+    use tempfile::tempfile;
+
+    use crate::db::vlog::ValueLogReader;
 
     use super::{ValueLogRecord, VarUInt};
 
@@ -195,5 +222,46 @@ mod tests {
         let buf = buf.freeze();
         let crc32 = crc32fast::hash(&buf[..]);
         assert_eq!(crc32, (&encord[encord.len() - 4..]).get_u32());
+    }
+
+    fn gen_record(id: usize) -> ValueLogRecord {
+        let key = Bytes::copy_from_slice(format!("key-{:05}", id).as_bytes());
+        let value = Bytes::copy_from_slice(format!("value-{:05}", id).as_bytes());
+        ValueLogRecord::new(key, value)
+    }
+
+    #[tokio::test]
+    async fn read_some_record() -> anyhow::Result<()> {
+        let ring = rio::new()?;
+        let file = tempfile()?;
+
+        let records = (0..100).map(gen_record).collect_vec();
+        let encords = records.iter().map(|r| r.encode()).collect_vec();
+
+        let mut offset = 0;
+        let mut reqs = Vec::with_capacity(encords.len());
+
+        for encord in encords.iter() {
+            let req = ring.write_at(&file, encord, offset);
+            reqs.push(req);
+            offset += encord.len() as u64;
+        }
+        for req in reqs.drain(..) {
+            req.await?;
+        }
+
+        let mut reader = ValueLogReader {
+            ring: ring.clone(),
+            file: file.try_clone()?,
+            offset: 0,
+        };
+
+        for (_, record) in records.iter().enumerate() {
+            let read_record = reader.read_record().await?;
+            assert_eq!(record.key, read_record.key);
+            assert_eq!(record.value, read_record.value);
+        }
+
+        Ok(())
     }
 }
