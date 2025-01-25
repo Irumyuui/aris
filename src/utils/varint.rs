@@ -58,6 +58,14 @@ impl VarUInt {
         }
         Ok(result)
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn as_bytes(&self) -> &Bytes {
+        &self.bytes
+    }
 }
 
 impl From<u64> for VarUInt {
