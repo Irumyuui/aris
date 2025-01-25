@@ -6,8 +6,9 @@ const MAX_VAR_UINT_SIZE: usize = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum VarUIntError {
-    // #[error("Invalid VarUInt")]
-    // InvalidVarUInt,
+    #[error("Invalid Slice: {0}")]
+    InvalidSlice(String),
+
     #[error("{0}")]
     VarUIntTooLong(String),
 }
@@ -88,6 +89,28 @@ impl From<u64> for VarUInt {
 impl From<u32> for VarUInt {
     fn from(value: u32) -> Self {
         (value as u64).into()
+    }
+}
+
+impl TryFrom<&[u8]> for VarUInt {
+    type Error = VarUIntError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let zero_pos = value
+            .iter()
+            .position(|b| (b & 0b1000_0000) == 0)
+            .ok_or(VarUIntError::InvalidSlice("Zero pos not found".into()))?;
+
+        if zero_pos > MAX_VAR_UINT_SIZE {
+            return Err(VarUIntError::InvalidSlice(format!(
+                "Slice too long, zero_pos: {zero_pos}"
+            )));
+        }
+
+        let slice = &value[..=zero_pos];
+        Ok(VarUInt {
+            bytes: Bytes::copy_from_slice(slice),
+        })
     }
 }
 
@@ -177,5 +200,16 @@ mod tests {
             assert_eq!(varint.as_slice(), expected.as_ref());
             assert_eq!(varint.try_to_u64().unwrap(), value);
         }
+    }
+
+    #[test]
+    fn try_from_slice() {
+        let slice = &[
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0xFF,
+        ][..];
+        let excepted = u64::MAX;
+
+        let varint = VarUInt::try_from(slice).unwrap();
+        assert_eq!(varint.try_to_u64().unwrap(), excepted);
     }
 }
