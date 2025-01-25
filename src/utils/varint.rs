@@ -1,12 +1,13 @@
-use bytes::{Bytes, BytesMut};
+use std::fmt::{Debug, Display};
 
-const MAX_VAR_UINT_SIZE: usize = 12;
+use bytes::Bytes;
+
+const MAX_VAR_UINT_SIZE: usize = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum VarUIntError {
-    #[error("Invalid VarUInt")]
-    InvalidVarUInt,
-
+    // #[error("Invalid VarUInt")]
+    // InvalidVarUInt,
     #[error("{0}")]
     VarUIntTooLong(String),
 }
@@ -87,6 +88,22 @@ impl From<u64> for VarUInt {
 impl From<u32> for VarUInt {
     fn from(value: u32) -> Self {
         (value as u64).into()
+    }
+}
+
+impl Display for VarUInt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = self.try_to_u64().unwrap();
+        write!(f, "{}", value)
+    }
+}
+
+impl Debug for VarUInt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VarUInt")
+            .field("bytes", &self.bytes)
+            .field("value", &self.try_to_u64().unwrap())
+            .finish()
     }
 }
 
