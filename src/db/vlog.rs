@@ -7,6 +7,8 @@ use crate::{
     utils::varint::VarUInt,
 };
 
+const MARKER: u32 = 0x11451400;
+
 /// Log record is siminal to a WAL record, but it use to store the bigger value.
 ///
 /// The format on value-log file like this:
@@ -164,13 +166,100 @@ impl VLogOffsetReader {
     }
 }
 
+/// Value-Log file's tail.
+///
+/// The tail format like this:
+///
+/// | offsets | offset start: 8 bytes | offset count: 8 bytes | tail check sum: 4 bytes | marker: 4 bytes |
+#[derive(Debug)]
+pub struct VLogWriter {
+    ring: rio::Rio,
+    file: std::fs::File,
+    offsets: Vec<u64>,
+    write_bytes: u64,
+}
+
+impl VLogWriter {
+    pub async fn write_record(&mut self, record: &ValueLogRecord) -> Result<()> {
+        tracing::debug!(
+            "write record: key {:?} value {:?}",
+            record.key,
+            record.value
+        );
+
+        let encord = record.encode();
+        tracing::debug!("encord: {:?}", encord.len());
+
+        let offset = self.write_bytes;
+
+        let write_bytes = self
+            .ring
+            .write_at_ordered(&self.file, &encord, offset, rio::Ordering::None)
+            .await?;
+        if write_bytes != encord.len() {
+            return Err(Error::IO(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "Write record failed",
+            )));
+        }
+
+        self.offsets.push(offset);
+        self.write_bytes += encord.len() as u64;
+
+        Ok(())
+    }
+
+    pub async fn finish(self) -> Result<(), (Self, Error)> {
+        tracing::debug!("write tail, offsets: {:?}", self.offsets);
+
+        let mut buf = BytesMut::with_capacity(self.offsets.len() * 8 + 8 + 8 + 4 + 4);
+
+        for off in self.offsets.iter() {
+            buf.put_u64(*off);
+        }
+
+        let offset_start = match self.file.metadata().map(|m| m.len()) {
+            Ok(off) => off,
+            Err(e) => return Err((self, e.into())),
+        };
+
+        buf.put_u64(offset_start);
+        buf.put_u64(self.offsets.len() as u64);
+
+        let crc = crc32fast::hash(&buf[..]);
+        buf.put_u32(crc);
+        buf.put_u32(MARKER);
+
+        let buf = buf.freeze();
+
+        match self
+            .ring
+            .write_at_ordered(&self.file, &buf, offset_start, rio::Ordering::None)
+            .await
+        {
+            Ok(n) if n == buf.len() => Ok(()),
+            Ok(_) => Err((
+                self,
+                Error::IO(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "Write tail failed",
+                )),
+            )),
+            Err(e) => {
+                tracing::error!("Write tail failed: {}", e);
+                Err((self, e.into()))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::{Buf, BufMut, Bytes, BytesMut};
     use itertools::Itertools;
     use tempfile::tempfile;
 
-    use crate::db::vlog::VLogOffsetReader;
+    use crate::db::vlog::{VLogOffsetReader, VLogWriter};
 
     use super::{ValueLogRecord, VarUInt};
 
@@ -253,6 +342,73 @@ mod tests {
             offset = next_offset;
             assert_eq!(record.key, read_record.key);
             assert_eq!(record.value, read_record.value);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_some_record_and_finish() -> anyhow::Result<()> {
+        let ring = rio::new()?;
+        let file = tempfile()?;
+
+        let records = (0..2).map(gen_record).collect_vec();
+
+        let mut writer = VLogWriter {
+            ring: ring.clone(),
+            file: file.try_clone()?,
+            offsets: vec![],
+            write_bytes: 0,
+        };
+
+        for record in records.iter() {
+            writer.write_record(record).await?;
+        }
+        writer.finish().await.expect("write failed");
+
+        let file_len = file.metadata()?.len();
+        assert!(file_len > 24);
+
+        let mut tail = [0_u8; 24];
+        let read_len = ring.read_at(&file, &mut tail, file_len - 24).await?;
+        assert_eq!(read_len, 24);
+
+        let mut buf = tail.as_slice();
+        let offset_start = buf.get_u64();
+        let offset_count = buf.get_u64();
+        let read_crc = buf.get_u32();
+        let marker = buf.get_u32();
+        assert_eq!(marker, crate::db::vlog::MARKER);
+
+        let mut offset_buf = vec![0_u8; (offset_count * 8) as usize];
+        let read_len = ring.read_at(&file, &mut offset_buf, offset_start).await?;
+        assert_eq!(read_len, offset_buf.len());
+
+        let mut offsets = Vec::with_capacity(offset_count as usize);
+        let mut buf = offset_buf.as_slice();
+        for _ in 0..offset_count {
+            offsets.push(buf.get_u64());
+        }
+
+        offset_buf.extend_from_slice(&tail[..16]);
+        let crc = crc32fast::hash(&offset_buf[..]);
+        assert_eq!(crc, read_crc);
+
+        let reader = VLogOffsetReader {
+            file: file.try_clone()?,
+            ring: ring.clone(),
+        };
+
+        println!("offsets: {:?}", offsets);
+
+        for (i, offset) in offsets.iter().enumerate() {
+            println!("read order: {i}");
+
+            let (record, next_offset) = reader.read_record(*offset).await?;
+            assert_eq!(next_offset, *offset + record.encode().len() as u64);
+
+            let rec = records.get(i).expect("record not found");
+            assert_eq!(rec.key, record.key);
         }
 
         Ok(())
