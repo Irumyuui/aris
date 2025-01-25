@@ -56,13 +56,12 @@ impl ValueLogRecord {
     }
 }
 
-pub struct ValueLogReader {
+pub struct VLogOffsetReader {
     ring: rio::Rio,
     file: std::fs::File,
-    offset: u64,
 }
 
-impl ValueLogReader {
+impl VLogOffsetReader {
     pub fn new(ring: rio::Rio, path: impl AsRef<Path>) -> Result<Self> {
         if !std::fs::exists(path.as_ref())? {
             return Err(Error::ValueLogFileNotFound(
@@ -76,18 +75,13 @@ impl ValueLogReader {
             .create(false)
             .open(path)?;
 
-        Ok(Self {
-            ring,
-            file,
-            offset: 0,
-        })
+        Ok(Self { ring, file })
     }
 
-    // TODO: Maybe split this impl, `self.offset` is not a good idea.
-    pub async fn read_record(&mut self) -> Result<ValueLogRecord> {
+    pub async fn read_record(&self, offset: u64) -> Result<(ValueLogRecord, u64)> {
         let mut buf = BytesMut::zeroed(1);
 
-        let read_len = self.ring.read_at(&self.file, &mut buf, self.offset).await?;
+        let read_len = self.ring.read_at(&self.file, &mut buf, offset).await?;
         if read_len != 1 {
             return Err(Error::ValueLogFileCorrupted("Read data len failed".into()));
         }
@@ -98,10 +92,7 @@ impl ValueLogReader {
         buf.resize(buf.len() + data_len, 0);
 
         let size_buf = &mut buf[1..];
-        let key_value_len = self
-            .ring
-            .read_at(&self.file, &size_buf, 1 + self.offset)
-            .await?;
+        let key_value_len = self.ring.read_at(&self.file, &size_buf, 1 + offset).await?;
         if key_value_len != data_len {
             return Err(Error::ValueLogFileCorrupted("Read data failed".into()));
         }
@@ -126,18 +117,18 @@ impl ValueLogReader {
 
         let (value_buf, crc_buf) = value_buf.split_at_mut(value_len as usize);
 
-        let read_key_req =
-            self.ring
-                .read_at(&self.file, &key_buf, 1 + data_len as u64 + self.offset);
+        let read_key_req = self
+            .ring
+            .read_at(&self.file, &key_buf, 1 + data_len as u64 + offset);
         let read_value_req = self.ring.read_at(
             &self.file,
             &value_buf,
-            1 + data_len as u64 + key_len as u64 + self.offset,
+            1 + data_len as u64 + key_len as u64 + offset,
         );
         let read_crc_req = self.ring.read_at(
             &self.file,
             &crc_buf,
-            1 + data_len as u64 + key_len as u64 + value_len as u64 + self.offset,
+            1 + data_len as u64 + key_len as u64 + value_len as u64 + offset,
         );
 
         if read_key_req.await? != key_len as usize {
@@ -167,9 +158,9 @@ impl ValueLogReader {
                 ..(1 + data_len as usize + key_len as usize + value_len as usize),
         );
 
-        self.offset += 1 + data_len as u64 + key_len as u64 + value_len as u64 + 4;
+        let next_offset = offset + 1 + data_len as u64 + key_len as u64 + value_len as u64 + 4;
 
-        return Ok(ValueLogRecord { key, value });
+        return Ok((ValueLogRecord { key, value }, next_offset));
     }
 }
 
@@ -179,7 +170,7 @@ mod tests {
     use itertools::Itertools;
     use tempfile::tempfile;
 
-    use crate::db::vlog::ValueLogReader;
+    use crate::db::vlog::VLogOffsetReader;
 
     use super::{ValueLogRecord, VarUInt};
 
@@ -251,14 +242,15 @@ mod tests {
             req.await?;
         }
 
-        let mut reader = ValueLogReader {
+        let mut offset = 0;
+        let reader = VLogOffsetReader {
             ring: ring.clone(),
             file: file.try_clone()?,
-            offset: 0,
         };
 
         for (_, record) in records.iter().enumerate() {
-            let read_record = reader.read_record().await?;
+            let (read_record, next_offset) = reader.read_record(offset).await?;
+            offset = next_offset;
             assert_eq!(record.key, read_record.key);
             assert_eq!(record.value, read_record.value);
         }
