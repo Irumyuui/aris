@@ -316,7 +316,7 @@ mod tests {
         let ring = rio::new()?;
         let file = tempfile()?;
 
-        let records = (0..100).map(gen_record).collect_vec();
+        let records = (0..1000).map(gen_record).collect_vec();
         let encords = records.iter().map(|r| r.encode()).collect_vec();
 
         let mut offset = 0;
@@ -352,7 +352,7 @@ mod tests {
         let ring = rio::new()?;
         let file = tempfile()?;
 
-        let records = (0..2).map(gen_record).collect_vec();
+        let records = (0..1000).map(gen_record).collect_vec();
 
         let mut writer = VLogWriter {
             ring: ring.clone(),
