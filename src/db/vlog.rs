@@ -1,216 +1,120 @@
-use std::{os::fd, path::Path};
+use std::path::Path;
 
-use anyhow::ensure;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use fast_async_mutex::mutex::Mutex;
-use tokio::{
-    fs::File,
-    io::{AsyncReadExt, AsyncWriteExt},
+use bytes::{Buf, Bytes, BytesMut};
+
+use crate::{
+    error::{Error, Result},
+    utils::varint::VarUInt,
 };
 
-// Format:
-// | crc32 | key_len | value_len | key | value |
-pub struct Entry {
+/// Log record is siminal to a WAL record, but it use to store the bigger value.
+///
+/// The format on value-log file like this:
+///
+/// | data len: 1 byte | key len | value len | key | value | check sum: 4 bytes |
+///
+///  - `key len` and `value len` will store like a `VarUInt` format.
+///  - `check sum`: a crc32 checksum of the record.
+///  - `data len`: the len of `key_len`'s varint format len and `value_len`'s varint format len sum.   
+#[derive(Clone)]
+pub struct ValueLogRecord {
     key: Bytes,
     value: Bytes,
 }
 
-impl Entry {
-    fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(8 + 8 + self.key.len() + self.value.len());
-
-        buf.put_u64(self.key.len() as u64);
-        buf.put_u64(self.value.len() as u64);
-        buf.put(self.key.as_ref());
-        buf.put(self.value.as_ref());
-
-        buf.freeze()
-    }
-
-    fn decode(&self, mut buf: &[u8]) -> anyhow::Result<Entry> {
-        ensure!(buf.len() >= 24, "buf is too short, len: {}", buf.len());
-
-        let crc32 = buf.get_u32();
-        let key_len = buf.get_u64();
-        let value_len = buf.get_u64();
-
-        ensure!(
-            buf.len() >= 24 + key_len as usize + value_len as usize,
-            "buf is too short, len: {}",
-            buf.len()
-        );
-
-        let key = Bytes::copy_from_slice(&buf[..key_len as usize]);
-        let value =
-            Bytes::copy_from_slice(&buf[key_len as usize..key_len as usize + value_len as usize]);
-
-        Ok(Self { key, value })
-    }
+pub struct ValueLogReader {
+    ring: rio::Rio,
+    file: std::fs::File,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Pointer {
-    offset: u64,
-}
-pub struct LogWriter {
-    fd: Mutex<File>,
-}
-
-impl LogWriter {
-    pub async fn open(log_file_path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        ensure!(
-            !tokio::fs::metadata(&log_file_path).await?.is_file(),
-            "log file already exists"
-        );
-
-        let file = tokio::fs::OpenOptions::new()
-            .read(false)
-            .write(true)
-            .create(true)
-            .append(true)
-            .open(log_file_path)
-            .await?;
-
-        Ok(Self {
-            fd: Mutex::new(file),
-        })
-    }
-
-    pub async fn write(&self, entries: &[Entry]) -> anyhow::Result<Vec<Pointer>> {
-        let mut buf = Vec::with_capacity(entries.len() * 24 * 10);
-        let mut ptrs = Vec::with_capacity(entries.len());
-
-        for entry in entries {
-            let entry_bytes = entry.encode();
-            let crc32 = crc32fast::hash(&entry_bytes);
-
-            let ptrs = Pointer {
-                offset: buf.len() as _,
-            };
-
-            let ptr = buf.put_u32(crc32);
-            buf.put(entry_bytes);
+impl ValueLogReader {
+    pub fn new(ring: rio::Rio, path: impl AsRef<Path>) -> Result<Self> {
+        if !std::fs::exists(path.as_ref())? {
+            return Err(Error::ValueLogFileNotFound(
+                path.as_ref().to_string_lossy().into_owned(),
+            ));
         }
 
-        self.fd.lock().await.write_all(&buf).await?;
-        Ok(ptrs)
-    }
-}
-
-pub struct LogReader {
-    fd: Mutex<File>,
-}
-
-impl LogReader {
-    pub async fn open(log_file_path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        ensure!(
-            tokio::fs::metadata(&log_file_path).await?.is_file(),
-            "log file not exists"
-        );
-
-        let file = tokio::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .write(false)
             .create(false)
-            .open(log_file_path)
-            .await?;
+            .open(path)?;
 
-        Ok(Self {
-            fd: Mutex::new(file),
-        })
+        Ok(Self { ring, file })
     }
 
-    pub async fn read(&self) -> anyhow::Result<Vec<Entry>> {
-        let mut head = [0u8; 24];
-        let mut entries = Vec::new();
-        let mut entry_buf = Vec::with_capacity(16);
+    pub async fn read_record(&self) -> Result<ValueLogRecord> {
+        let mut buf = BytesMut::zeroed(1);
 
-        // Meybe consider use io-uring
-        loop {
-            let mut fd = self.fd.lock().await;
-            let n = fd.read_exact(&mut head).await?;
-            if n == 0 {
-                break;
-            }
-            ensure!(n == 24, "read head failed");
-
-            let mut buf = head.as_slice();
-            let crc32 = buf.get_u32();
-            let key_len = buf.get_u64();
-            let value_len = buf.get_u64();
-
-            entry_buf.clear();
-            entry_buf.resize(8 + 8 + key_len as usize + value_len as usize, 0);
-            let mut buf = &mut entry_buf[..];
-            buf.put_u64(key_len);
-            buf.put_u64(value_len);
-
-            let n = fd.read_exact(buf).await?;
-            ensure!(
-                n == key_len as usize + value_len as usize,
-                "read entry failed"
-            );
-
-            ensure!(crc32 == crc32fast::hash(&entry_buf), "crc32 not match");
-            let entry = Entry {
-                key: Bytes::copy_from_slice(&entry_buf[16..16 + key_len as usize]),
-                value: Bytes::copy_from_slice(&entry_buf[16 + key_len as usize..]),
-            };
-            entries.push(entry);
+        let read_size = self.ring.read_at(&self.file, &mut buf, 0).await?;
+        if read_size != 1 {
+            return Err(Error::ValueLogFileCorrupted("Read data len failed".into()));
         }
 
-        Ok(entries)
-    }
-}
+        let data_len = buf[0] as usize;
 
-#[cfg(test)]
-mod tests {
-    use std::{path::PathBuf, str::FromStr};
+        buf.resize(buf.len() + data_len, 0);
 
-    use crate::db::vlog::{Entry, LogReader, LogWriter};
-
-    struct Guard(PathBuf);
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            println!("Remove");
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
-    #[ignore = "The value logger is not implemented yet"]
-    #[tokio::test]
-    async fn log_rw() {
-        let path = std::env::temp_dir().join("vlog_rw_test");
-
-        let _guard = Guard(path.clone());
-
-        let entries = vec![
-            Entry {
-                key: "key1".into(),
-                value: "value1".into(),
-            },
-            Entry {
-                key: "key2".into(),
-                value: "value2".into(),
-            },
-        ];
-
-        let writer = LogWriter::open(&path).await.unwrap(); // wtf, why it will crash???
-        let ptrs = writer.write(&entries).await.unwrap();
-
-        let mut prev_offset = 0;
-        for (i, e) in entries.iter().enumerate() {
-            let ptr = ptrs[i];
-            assert_eq!(ptr.offset, prev_offset);
-            prev_offset += 24 + e.key.len() as u64 + e.value.len() as u64;
+        let size_buf = &mut buf[1..];
+        let read_size = self.ring.read_at(&self.file, &size_buf, 1).await?;
+        if read_size != data_len {
+            return Err(Error::ValueLogFileCorrupted("Read data failed".into()));
         }
 
-        let reader = LogReader::open(&path).await.unwrap();
-        let read_entries = reader.read().await.unwrap();
-        for (a, b) in entries.iter().zip(read_entries.iter()) {
-            assert_eq!(a.key, b.key);
-            assert_eq!(a.value, b.value);
+        let var_key_len = VarUInt::try_from(&buf[..])
+            .map_err(|e| Error::ValueLogFileCorrupted(format!("Parse key len failed: {}", e)))?;
+        let var_value_len = VarUInt::try_from(&buf[var_key_len.as_slice().len()..])
+            .map_err(|e| Error::ValueLogFileCorrupted(format!("Parse value len failed: {}", e)))?;
+
+        let key_len = var_key_len.try_to_u64().map_err(|e| {
+            Error::ValueLogFileCorrupted(format!("Convert key len to u64 failed: {}", e))
+        })?;
+        let value_len = var_value_len.try_to_u64().map_err(|e| {
+            Error::ValueLogFileCorrupted(format!("Convert value len to u64 failed: {}", e))
+        })?;
+
+        buf.resize(1 + data_len + key_len as usize + value_len as usize + 4, 0);
+
+        let (mut key_buf, value_buf) = buf.split_at_mut(1 + data_len + key_len as usize);
+        key_buf = &mut key_buf[1 + data_len..];
+
+        let (value_buf, crc_buf) = value_buf.split_at_mut(value_len as usize);
+
+        let read_key_req = self.ring.read_at(&self.file, &key_buf, 1 + data_len as u64);
+        let read_value_req =
+            self.ring
+                .read_at(&self.file, &value_buf, 1 + data_len as u64 + key_len as u64);
+        let read_crc_req = self.ring.read_at(
+            &self.file,
+            &crc_buf,
+            1 + data_len as u64 + key_len as u64 + value_len as u64,
+        );
+
+        if read_key_req.await? != key_len as usize {
+            return Err(Error::ValueLogFileCorrupted("Read key failed".into()));
         }
+        if read_value_req.await? != value_len as usize {
+            return Err(Error::ValueLogFileCorrupted("Read value failed".into()));
+        }
+        if read_crc_req.await? != 4 {
+            return Err(Error::ValueLogFileCorrupted("Read crc failed".into()));
+        }
+
+        let buf = buf.freeze();
+        let read_crc = (&buf[buf.len() - 4..]).get_u32();
+        let crc = crc32fast::hash(&buf[..buf.len() - 4]);
+
+        if read_crc != crc {
+            return Err(Error::ValueLogFileCorrupted("CRC32 checksum failed".into()));
+        }
+
+        let key = buf.slice((1 + data_len as usize)..(1 + data_len as usize + key_len as usize));
+        let value = buf.slice(
+            (1 + data_len as usize + key_len as usize)
+                ..(1 + data_len as usize + key_len as usize + value_len as usize),
+        );
+
+        return Ok(ValueLogRecord { key, value });
     }
 }

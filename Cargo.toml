@@ -8,7 +8,7 @@ edition = "2021"
 anyhow = "1.0.95"
 thiserror = "2.0.11"
 bytes = "1.9.0"
-crossbeam = { version = "0.8.4", features = ["crossbeam-epoch"] }
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel", "crossbeam-epoch", "crossbeam-queue"] }
 mimalloc = "0.1.43"
 rand = "0.8.5"
 # log
