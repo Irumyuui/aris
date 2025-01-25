@@ -42,6 +42,8 @@ impl ValueLogRecord {
         buf.put_u8((key_len.len() + value_len.len()) as u8);
         buf.put(key_len.as_bytes().clone());
         buf.put(value_len.as_bytes().clone());
+        buf.put(self.key.clone());
+        buf.put(self.value.clone());
 
         let crc = crc32fast::hash(&buf[..]);
         buf.put_u32(crc);
@@ -144,5 +146,54 @@ impl ValueLogReader {
         );
 
         return Ok(ValueLogRecord { key, value });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+    use super::{ValueLogRecord, VarUInt};
+
+    #[test]
+    fn record_encode() {
+        let key = Bytes::copy_from_slice(b"key");
+        let value = Bytes::copy_from_slice(b"value");
+
+        let record = ValueLogRecord::new(key.clone(), value.clone());
+        let encord = record.encode();
+
+        let var_key_len = VarUInt::from(key.len() as u64);
+        let var_value_len = VarUInt::from(value.len() as u64);
+
+        assert_eq!(var_key_len.len() + var_value_len.len(), encord[0] as usize);
+        assert_eq!(var_key_len.as_bytes(), &encord[1..1 + var_key_len.len()]);
+        assert_eq!(
+            var_value_len.as_bytes(),
+            &encord[1 + var_key_len.len()..1 + var_key_len.len() + var_value_len.len()]
+        );
+
+        assert_eq!(
+            key,
+            encord.slice(
+                1 + var_key_len.len() + var_value_len.len()
+                    ..1 + var_key_len.len() + var_value_len.len() + key.len()
+            )
+        );
+        assert_eq!(
+            value,
+            encord.slice(1 + var_key_len.len() + var_value_len.len() + key.len()..encord.len() - 4)
+        );
+
+        let mut buf = BytesMut::new();
+        buf.put_u8(var_key_len.len() as u8 + var_value_len.len() as u8);
+        buf.put(var_key_len.as_bytes().clone());
+        buf.put(var_value_len.as_bytes().clone());
+        buf.put(key);
+        buf.put(value);
+
+        let buf = buf.freeze();
+        let crc32 = crc32fast::hash(&buf[..]);
+        assert_eq!(crc32, (&encord[encord.len() - 4..]).get_u32());
     }
 }
