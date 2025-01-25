@@ -83,6 +83,7 @@ impl ValueLogReader {
         })
     }
 
+    // TODO: Maybe split this impl, `self.offset` is not a good idea.
     pub async fn read_record(&mut self) -> Result<ValueLogRecord> {
         let mut buf = BytesMut::zeroed(1);
 
