@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
     error::{Error, Result},
@@ -20,6 +20,34 @@ use crate::{
 pub struct ValueLogRecord {
     key: Bytes,
     value: Bytes,
+}
+
+impl ValueLogRecord {
+    pub fn new(key: Bytes, value: Bytes) -> Self {
+        Self { key, value }
+    }
+
+    pub fn encode(&self) -> Bytes {
+        let key_len = VarUInt::from(self.key.len() as u64);
+        let value_len = VarUInt::from(self.value.len() as u64);
+
+        let mut buf = BytesMut::with_capacity(
+            1 + key_len.as_slice().len()
+                + value_len.as_slice().len()
+                + self.key.len()
+                + self.value.len()
+                + 4,
+        );
+
+        buf.put_u8((key_len.len() + value_len.len()) as u8);
+        buf.put(key_len.as_bytes().clone());
+        buf.put(value_len.as_bytes().clone());
+
+        let crc = crc32fast::hash(&buf[..]);
+        buf.put_u32(crc);
+
+        buf.freeze()
+    }
 }
 
 pub struct ValueLogReader {
