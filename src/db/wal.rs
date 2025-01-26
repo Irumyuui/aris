@@ -29,7 +29,7 @@ const PADDING: [&[u8]; 7] = [
     &[0, 0, 0, 0, 0, 0],
     &[0, 0, 0, 0, 0, 0, 0],
 ];
-const BLOCK_SIZE: usize = 8 * 1024 * 1024;
+const BLOCK_SIZE: usize = 32 * 1024;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
@@ -260,8 +260,13 @@ impl ReLogReader {
             .read(true)
             .open(path)
             .map_err(|e| (vec![], e.into()))?;
+
+        self.read_from_file(file).await
+    }
+
+    async fn read_from_file(&self, file: std::fs::File) -> Result<Vec<Bytes>, (Vec<Bytes>, Error)> {
         let mut err = None;
-        let records = match self.read_file(file).await {
+        let records = match self.read_file_inner(file).await {
             Ok(v) => v,
             Err((v, e)) => {
                 err = Some(e);
@@ -298,18 +303,23 @@ impl ReLogReader {
         }
     }
 
-    async fn read_file(&self, file: std::fs::File) -> Result<Vec<Record>, (Vec<Record>, Error)> {
-        let file_len = file.metadata().map_err(|e| (vec![], e.into()))?.len();
+    async fn read_file_inner(
+        &self,
+        file: std::fs::File,
+    ) -> Result<Vec<Record>, (Vec<Record>, Error)> {
+        let mut file_len = file.metadata().map_err(|e| (vec![], e.into()))?.len();
         let file = Arc::new(file);
 
-        let blcok_count = (file_len + BLOCK_SIZE as u64) / BLOCK_SIZE as u64;
+        let blcok_count = (file_len + (BLOCK_SIZE - 1) as u64) / BLOCK_SIZE as u64;
         let mut tasks = Vec::with_capacity(blcok_count as usize);
+
         for i in 0..blcok_count {
-            let block_remain = if i == blcok_count - 1 {
-                file_len % BLOCK_SIZE as u64
-            } else {
+            let block_remain = if file_len >= BLOCK_SIZE as _ {
                 BLOCK_SIZE as u64
+            } else {
+                file_len
             };
+            file_len -= block_remain;
 
             let ring = self.ring.clone();
             let file = file.clone();
@@ -345,6 +355,8 @@ impl ReLogReader {
         block_id: u64,
         block_remain: u64,
     ) -> Result<Vec<Record>, (Vec<Record>, Error)> {
+        tracing::debug!("read block: {}, remain: {}", block_id, block_remain);
+
         let mut buf = BytesMut::zeroed(block_remain as usize);
         let read_len = ring
             .read_at(&file, &mut buf, block_id * BLOCK_SIZE as u64)
@@ -365,11 +377,44 @@ impl ReLogReader {
         while buf.has_remaining() && buf.len() > 7 {
             let pref = buf;
 
+            if buf.len() < 2 {
+                return Err((
+                    records,
+                    Error::ReLogReadCorrupted("payload len not enough".to_string()),
+                ));
+            }
             let len = buf.get_u16();
+
+            tracing::debug!("record len: {}", len);
+
+            if buf.len() < 1 {
+                return Err((
+                    records,
+                    Error::ReLogReadCorrupted("record type not enough".to_string()),
+                ));
+            }
             let ty = buf.get_u8();
+
+            tracing::debug!("record type: {}", ty);
+
+            if buf.len() < len as usize {
+                return Err((
+                    records,
+                    Error::ReLogReadCorrupted("payload not enough".to_string()),
+                ));
+            }
             let payload = block.slice_ref(&buf[..len as usize]);
 
+            tracing::debug!("payload len: {}", payload.len());
+
             buf = &buf[len as usize..];
+
+            if buf.len() < 4 {
+                return Err((
+                    records,
+                    Error::ReLogReadCorrupted("crc not enough".to_string()),
+                ));
+            }
             let crc = buf.get_u32();
 
             let record_slice = &pref[..len as usize + 3];
@@ -399,10 +444,13 @@ impl ReLogReader {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::ensure;
     use bytes::{Buf, BufMut, Bytes, BytesMut};
+    use itertools::Itertools;
+    use rand::Rng;
     use tempfile::tempfile;
 
-    use crate::db::wal::{ReLogWriter, BLOCK_SIZE};
+    use crate::db::wal::{ReLogReader, ReLogWriter, BLOCK_SIZE};
 
     use super::{Record, RecordType};
 
@@ -635,6 +683,230 @@ mod tests {
             &sec_encode[..],
             &read_buf[first_encord.len()..first_encord.len() + sec_encode.len()]
         );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_one_block() -> anyhow::Result<()> {
+        let ring = rio::new()?;
+        let file = tempfile()?;
+
+        let payloads = (0..10)
+            .map(|_| gen_payload(rand::thread_rng().gen_range(10..=30)))
+            .map(|p| Record {
+                payload: p,
+                ty: RecordType::Full,
+            })
+            .collect_vec();
+
+        let encodes = payloads.iter().map(|r| r.encord()).collect_vec();
+        let total_len = encodes.iter().map(|e| e.len()).sum::<usize>();
+        let mut total_bytes = BytesMut::with_capacity(total_len);
+        for b in &encodes {
+            total_bytes.extend(b);
+        }
+        let total_bytes = total_bytes.freeze();
+
+        let res = ring.write_at(&file, &total_bytes, 0).await?;
+        ensure!(res == total_len, "write bytes not equal");
+
+        let reader = ReLogReader::new(ring.clone());
+        let read_payloads = reader
+            .read_from_file(file.try_clone()?)
+            .await
+            .expect("should not have error");
+
+        assert_eq!(read_payloads.len(), payloads.len());
+
+        for (read, expect) in read_payloads.iter().zip(payloads.iter()) {
+            assert_eq!(read, &expect.payload);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_multi_block() -> anyhow::Result<()> {
+        let ring = rio::new()?;
+        let file = tempfile()?;
+
+        let payload = gen_payload((BLOCK_SIZE - 7) * 3 + BLOCK_SIZE / 2);
+        let records = vec![
+            Record {
+                payload: payload.slice(0..(BLOCK_SIZE - 7)),
+                ty: RecordType::First,
+            },
+            Record {
+                payload: payload.slice(BLOCK_SIZE - 7..(BLOCK_SIZE - 7) * 2),
+                ty: RecordType::Middle,
+            },
+            Record {
+                payload: payload.slice((BLOCK_SIZE - 7) * 2..(BLOCK_SIZE - 7) * 3),
+                ty: RecordType::Middle,
+            },
+            Record {
+                payload: payload.slice((BLOCK_SIZE - 7) * 3..(BLOCK_SIZE - 7) * 3 + BLOCK_SIZE / 2),
+                ty: RecordType::Last,
+            },
+        ];
+        let encords = records.iter().map(|r| r.encord()).collect_vec();
+        let total_len = encords.iter().map(|e| e.len()).sum::<usize>();
+
+        tracing::debug!("total len: {}", total_len);
+        for e in &encords {
+            tracing::debug!("encord len: {}", e.len());
+        }
+
+        for r in &records {
+            tracing::debug!("payload len: {}, ty: {}", r.payload.len(), r.ty as u8);
+        }
+
+        let mut write_bytes = BytesMut::with_capacity(total_len);
+        for b in &encords {
+            write_bytes.extend(b);
+        }
+        let write_bytes = write_bytes.freeze();
+
+        let res = ring.write_at(&file, &write_bytes, 0).await?;
+        ensure!(res == total_len, "write bytes not equal");
+
+        let reader = ReLogReader::new(ring.clone());
+        let read_payloads = reader
+            .read_from_file(file.try_clone()?)
+            .await
+            .expect("should not have error");
+
+        assert_eq!(read_payloads.len(), 1);
+        assert!(read_payloads[0] == payload);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_one_block_found_error() -> anyhow::Result<()> {
+        let ring = rio::new()?;
+        let file = tempfile()?;
+
+        let payloads = (0..10)
+            .map(|_| gen_payload(rand::thread_rng().gen_range(10..=30)))
+            .map(|p| Record {
+                payload: p,
+                ty: RecordType::Full,
+            })
+            .collect_vec();
+
+        let encodes = payloads.iter().map(|r| r.encord()).collect_vec();
+        let total_len = encodes.iter().map(|e| e.len()).sum::<usize>();
+        let mut total_bytes = BytesMut::with_capacity(total_len);
+        for b in &encodes {
+            total_bytes.extend(b);
+        }
+        let total_bytes = total_bytes.freeze();
+
+        let res = ring.write_at(&file, &total_bytes, 0).await?;
+        ensure!(res == total_len, "write bytes not equal");
+
+        let error_data = Bytes::copy_from_slice(b"error data");
+        let res = ring.write_at(&file, &error_data, total_len as u64).await?;
+        ensure!(res == error_data.len(), "write bytes not equal");
+
+        let reader = ReLogReader::new(ring.clone());
+        let (read_payloads, _) = reader
+            .read_from_file(file.try_clone()?)
+            .await
+            .expect_err("should have error");
+
+        assert_eq!(read_payloads.len(), payloads.len());
+
+        for (read, expect) in read_payloads.iter().zip(payloads.iter()) {
+            assert_eq!(read, &expect.payload);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_pad_data() -> anyhow::Result<()> {
+        let ring = rio::new()?;
+        let file = tempfile()?;
+
+        let payloads = vec![gen_payload(BLOCK_SIZE - 14), gen_payload(14)];
+        let records = payloads
+            .iter()
+            .map(|r| Record {
+                payload: r.clone(),
+                ty: RecordType::Full,
+            })
+            .collect_vec();
+        let encords = records.iter().map(|r| r.encord()).collect_vec();
+
+        let total_len = encords.iter().map(|e| e.len()).sum::<usize>() + 7;
+        let mut total_bytes = BytesMut::with_capacity(total_len);
+        total_bytes.extend(encords[0].clone());
+        total_bytes.extend(&[0; 7]);
+        total_bytes.extend(encords[1].clone());
+        let total_bytes = total_bytes.freeze();
+
+        let res = ring.write_at(&file, &total_bytes, 0).await?;
+        ensure!(res == total_len, "write bytes not equal");
+
+        let reader = ReLogReader::new(ring.clone());
+        let read_payloads = reader
+            .read_from_file(file.try_clone()?)
+            .await
+            .expect("should not have error");
+
+        assert_eq!(read_payloads.len(), payloads.len());
+        for (read, expect) in read_payloads.iter().zip(payloads.iter()) {
+            assert_eq!(read, expect);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_split_data() -> anyhow::Result<()> {
+        let ring = rio::new()?;
+        let file = tempfile()?;
+
+        let payloads = vec![gen_payload(BLOCK_SIZE - 15), gen_payload(14)];
+        let records = vec![
+            Record {
+                payload: payloads[0].clone(),
+                ty: RecordType::Full,
+            },
+            Record {
+                payload: payloads[1].slice(0..1),
+                ty: RecordType::First,
+            },
+            Record {
+                payload: payloads[1].slice(1..),
+                ty: RecordType::Last,
+            },
+        ];
+        let encords = records.iter().map(|r| r.encord()).collect_vec();
+
+        let total_len = encords.iter().map(|e| e.len()).sum::<usize>();
+        let mut total_bytes = BytesMut::with_capacity(total_len);
+        for b in &encords {
+            total_bytes.extend(b);
+        }
+        let total_bytes = total_bytes.freeze();
+
+        let res = ring.write_at(&file, &total_bytes, 0).await?;
+        assert_eq!(res, total_len, "write bytes not equal");
+
+        let reader = ReLogReader::new(ring.clone());
+        let read_payloads = reader
+            .read_from_file(file.try_clone()?)
+            .await
+            .expect("should not have error");
+
+        assert_eq!(read_payloads.len(), payloads.len());
+        for (read, expect) in read_payloads.iter().zip(payloads.iter()) {
+            assert_eq!(read, expect);
+        }
 
         Ok(())
     }
