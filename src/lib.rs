@@ -20,6 +20,7 @@ fn init() {
         .with_target(true)
         .with_file(true)
         .with_level(true)
+        .without_time()
         .with_thread_ids(true)
         .init();
 }

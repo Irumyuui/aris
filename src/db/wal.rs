@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use bytes::{BufMut, Bytes, BytesMut};
+use itertools::Itertools;
 
 use crate::error::{Error, Result};
 
@@ -17,6 +18,17 @@ use crate::error::{Error, Result};
 ///
 /// A recovery file corresponds to a memtable.
 
+// const PADDING: &[u8] = &[0; 7];
+
+const PADDING: [&[u8]; 7] = [
+    &[0],
+    &[0, 0],
+    &[0, 0, 0],
+    &[0, 0, 0, 0],
+    &[0, 0, 0, 0, 0],
+    &[0, 0, 0, 0, 0, 0],
+    &[0, 0, 0, 0, 0, 0, 0],
+];
 const BLOCK_SIZE: usize = 8 * 1024 * 1024;
 
 #[repr(u8)]
@@ -47,9 +59,190 @@ impl Record {
     }
 }
 
+#[derive(Debug)]
+pub struct ReLogWriter {
+    ring: rio::Rio,
+    file: std::fs::File,
+
+    // Already written block count.
+    written_block_len: usize,
+
+    // The offset within the current block.
+    block_offset: u64,
+}
+
+impl ReLogWriter {
+    pub fn new(ring: rio::Rio, path: impl AsRef<Path>) -> Result<Self> {
+        if path.as_ref().exists() {
+            return Err(Error::ReLogFileCreatedFailed(format!(
+                "re-log file already exists, path: {:?}",
+                path.as_ref()
+            )));
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .read(false)
+            .write(true)
+            .create_new(true)
+            .append(true)
+            .open(path)?;
+
+        let this = Self {
+            ring,
+            file,
+            written_block_len: 0,
+            block_offset: 0,
+        };
+        Ok(this)
+    }
+
+    pub async fn write(&mut self, payload: Bytes) -> Result<()> {
+        self.try_pad_block().await?;
+
+        tracing::debug!(
+            "write payload: {:?}, less block bytes: {}",
+            payload.len(),
+            self.block_remain_bytes(),
+        );
+
+        if payload.len() + 7 <= self.block_remain_bytes() as usize {
+            let record = Record {
+                payload,
+                ty: RecordType::Full,
+            };
+
+            return self.write_records(&[record]).await;
+        }
+
+        let mut records = Vec::with_capacity(payload.len() / BLOCK_SIZE + 1);
+        let mut payload_remain = payload.len();
+
+        // ready to split payload
+        // first block
+        records.push(Record {
+            payload: payload.slice(0..(self.block_remain_bytes() - 7) as usize),
+            ty: RecordType::First,
+        });
+        payload_remain -= self.block_remain_bytes() as usize - 7;
+
+        // middle block and last block
+        while payload_remain > 0 {
+            let record = if payload_remain > BLOCK_SIZE - 7 {
+                Record {
+                    payload: payload.slice(
+                        (payload.len() - payload_remain)
+                            ..(payload.len() - payload_remain + BLOCK_SIZE - 7),
+                    ),
+                    ty: RecordType::Middle,
+                }
+            } else {
+                Record {
+                    payload: payload.slice((payload.len() - payload_remain)..),
+                    ty: RecordType::Last,
+                }
+            };
+            records.push(record);
+            payload_remain -= (BLOCK_SIZE - 7).min(payload_remain);
+        }
+
+        if records.len() == 1 {
+            // is it possible?
+            records[0].ty = RecordType::Full;
+        }
+
+        return self.write_records(&records).await;
+    }
+
+    // WARNING
+    // io_uring needs to ensure that the lifetime of buf in the user process
+    // is longer than the lifetime of kernel operations
+    async fn write_records(&mut self, records: &[Record]) -> Result<()> {
+        tracing::debug!("write records: {:?}", records.len());
+
+        let encords = records.into_iter().map(|r| r.encord()).collect_vec();
+        let mut completions = Vec::with_capacity(encords.len());
+
+        for i in 0..encords.len() {
+            tracing::debug!("write record: {:?}, encode len: {}", i, encords[i].len());
+
+            let comp =
+                self.ring
+                    .write_at(&self.file, encords.get(i).unwrap(), self.last_file_offset());
+            completions.push((comp, encords.get(i).unwrap().len()));
+            self.block_offset += encords.get(i).unwrap().len() as u64;
+
+            // ensure next block
+            if self.block_remain_bytes() <= 7 {
+                if self.block_remain_bytes() > 0 {
+                    let comp = self.ring.write_at(
+                        &self.file,
+                        &PADDING[self.block_remain_bytes() as usize - 1],
+                        self.last_file_offset(),
+                    );
+                    completions.push((comp, self.block_remain_bytes() as usize));
+                }
+
+                self.block_offset = 0;
+                self.written_block_len += 1;
+            }
+        }
+
+        for (comp, len) in completions.into_iter() {
+            let writted_bytes = comp.await?;
+            assert_eq!(writted_bytes, len, "write bytes not equal, is it right?");
+        }
+
+        self.try_pad_block().await?;
+        Ok(())
+    }
+
+    async fn try_pad_block(&mut self) -> Result<()> {
+        if self.block_remain_bytes() <= 7 {
+            tracing::debug!("try pad block");
+
+            if self.block_remain_bytes() > 0 {
+                self.ring
+                    .write_at(
+                        &self.file,
+                        &PADDING[self.block_remain_bytes() as usize - 1],
+                        self.last_file_offset(),
+                    )
+                    .await?;
+            }
+            self.block_offset = 0;
+            self.written_block_len += 1;
+        }
+        Ok(())
+    }
+
+    fn last_file_offset(&self) -> u64 {
+        self.written_block_len as u64 * BLOCK_SIZE as u64 + self.block_offset
+    }
+
+    fn block_remain_bytes(&self) -> u64 {
+        BLOCK_SIZE as u64 - self.block_offset
+    }
+
+    pub async fn finish(self) -> Result<(), (Self, Error)> {
+        if self.block_remain_bytes() != 0 && self.block_offset != 0 {
+            let buf = BytesMut::zeroed(self.block_remain_bytes() as usize).freeze();
+            let writted_bytes = self
+                .ring
+                .write_at(&self.file, &buf, self.last_file_offset())
+                .await
+                .map_err(|e| (self, e.into()))?;
+            assert_eq!(writted_bytes, buf.len());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::{Buf, BufMut, Bytes, BytesMut};
+    use tempfile::tempfile;
+
+    use crate::db::wal::{ReLogWriter, BLOCK_SIZE};
 
     use super::{Record, RecordType};
 
@@ -85,5 +278,209 @@ mod tests {
         let calc_crc32 = crc32fast::hash(buf.as_ref());
 
         assert_eq!(crc, calc_crc32);
+    }
+
+    fn gen_payload(len: usize) -> Bytes {
+        let mut payload = BytesMut::with_capacity(len);
+        let mut b = b'a';
+        while payload.len() < len {
+            payload.put_u8(b);
+            b = (b - b'a' + 1) % 26 + b'a';
+        }
+        payload.freeze()
+    }
+
+    // expect write only one block.
+    #[tokio::test]
+    async fn write_in_one_block() -> anyhow::Result<()> {
+        let ring = rio::new()?;
+        let file = tempfile()?;
+
+        let payload = gen_payload(BLOCK_SIZE - 7);
+
+        let mut writer = ReLogWriter {
+            file: file.try_clone()?,
+            ring: ring.clone(),
+            written_block_len: 0,
+            block_offset: 0,
+        };
+        writer.write(payload.clone()).await?;
+        writer.finish().await.expect("finish failed");
+
+        assert_eq!(file.metadata()?.len(), BLOCK_SIZE as u64);
+
+        let mut buf = BytesMut::zeroed(BLOCK_SIZE);
+        let read_len = ring.read_at(&file, &mut buf, 0).await?;
+        assert_eq!(read_len, BLOCK_SIZE);
+
+        let buf = buf.freeze();
+
+        let record = Record {
+            payload,
+            ty: RecordType::Full,
+        };
+        let encord = record.encord();
+        assert_eq!(encord.len(), BLOCK_SIZE);
+        assert_eq!(buf, encord);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_some_block() -> anyhow::Result<()> {
+        let ring = rio::new()?;
+        let file = tempfile()?;
+
+        // 4 blocks
+        let payload = gen_payload((BLOCK_SIZE - 7) * 3 + BLOCK_SIZE / 2);
+
+        let mut writer = ReLogWriter {
+            file: file.try_clone()?,
+            ring: ring.clone(),
+            written_block_len: 0,
+            block_offset: 0,
+        };
+        writer.write(payload.clone()).await?;
+        writer.finish().await.expect("finish failed");
+
+        assert_eq!(file.metadata()?.len(), BLOCK_SIZE as u64 * 4);
+
+        let mut buf = BytesMut::zeroed(BLOCK_SIZE * 4);
+        let read_len = ring.read_at(&file, &mut buf, 0).await?;
+        assert_eq!(read_len, BLOCK_SIZE * 4);
+        let read_buf = buf.freeze();
+
+        let mut records = Vec::with_capacity(4);
+        let mut offset = 0;
+        for i in 0..4 {
+            let record = if i == 0 {
+                Record {
+                    payload: payload.slice(0..(BLOCK_SIZE - 7)),
+                    ty: RecordType::First,
+                }
+            } else if i == 3 {
+                Record {
+                    payload: payload.slice(offset..),
+                    ty: RecordType::Last,
+                }
+            } else {
+                Record {
+                    payload: payload.slice(offset..(offset + BLOCK_SIZE - 7)),
+                    ty: RecordType::Middle,
+                }
+            };
+            offset += BLOCK_SIZE - 7;
+            records.push(record);
+        }
+
+        let mut buf = BytesMut::zeroed(BLOCK_SIZE * 4);
+        let mut put_buf = &mut buf[..];
+        for r in &records {
+            put_buf.put(r.encord());
+        }
+
+        let target_buf = buf.freeze();
+        assert_eq!(read_buf, target_buf);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_pad_records() -> anyhow::Result<()> {
+        let ring = rio::new()?;
+        let file = tempfile()?;
+
+        let payloads = vec![gen_payload(BLOCK_SIZE - 14), gen_payload(14)];
+        let mut writer = ReLogWriter {
+            file: file.try_clone()?,
+            ring: ring.clone(),
+            written_block_len: 0,
+            block_offset: 0,
+        };
+        for payload in &payloads {
+            writer.write(payload.clone()).await?;
+        }
+        writer.finish().await.expect("finish failed");
+
+        assert_eq!(file.metadata()?.len(), BLOCK_SIZE as u64 * 2);
+        let read_buf = BytesMut::zeroed(BLOCK_SIZE * 2);
+        let read_len = ring.read_at(&file, &read_buf, 0).await?;
+        assert_eq!(read_len, BLOCK_SIZE * 2);
+        let read_buf = read_buf.freeze();
+
+        let first_record = Record {
+            payload: payloads[0].clone(),
+            ty: RecordType::Full,
+        };
+        let first_encord = first_record.encord();
+        assert_eq!(first_encord, &read_buf[..first_encord.len()]);
+
+        let sec_encode = Record {
+            payload: payloads[1].clone(),
+            ty: RecordType::Full,
+        }
+        .encord();
+
+        assert_eq!(
+            &sec_encode[..],
+            &read_buf[BLOCK_SIZE..BLOCK_SIZE + sec_encode.len()]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_pad_split_records() -> anyhow::Result<()> {
+        let ring = rio::new()?;
+        let file = tempfile()?;
+
+        let payloads = vec![gen_payload(BLOCK_SIZE - 15), gen_payload(14)];
+        let mut writer = ReLogWriter {
+            file: file.try_clone()?,
+            ring: ring.clone(),
+            written_block_len: 0,
+            block_offset: 0,
+        };
+        for payload in &payloads {
+            writer.write(payload.clone()).await?;
+        }
+        writer.finish().await.expect("finish failed");
+
+        assert_eq!(file.metadata()?.len(), BLOCK_SIZE as u64 * 2);
+        let read_buf = BytesMut::zeroed(BLOCK_SIZE * 2);
+        let read_len = ring.read_at(&file, &read_buf, 0).await?;
+        assert_eq!(read_len, BLOCK_SIZE * 2);
+        let read_buf = read_buf.freeze();
+
+        let first_record = Record {
+            payload: payloads[0].clone(),
+            ty: RecordType::Full,
+        };
+        let first_encord = first_record.encord();
+        assert_eq!(first_encord, &read_buf[..first_encord.len()]);
+
+        let sec_first_encode = Record {
+            payload: payloads[1].slice(0..1),
+            ty: RecordType::First,
+        }
+        .encord();
+        let sec_last_encode = Record {
+            payload: payloads[1].slice(1..),
+            ty: RecordType::Last,
+        }
+        .encord();
+
+        let mut sec_encode =
+            BytesMut::with_capacity(sec_first_encode.len() + sec_last_encode.len());
+        sec_encode.put(sec_first_encode);
+        sec_encode.put(sec_last_encode);
+        let sec_encode = sec_encode.freeze();
+
+        assert_eq!(
+            &sec_encode[..],
+            &read_buf[first_encord.len()..first_encord.len() + sec_encode.len()]
+        );
+
+        Ok(())
     }
 }
