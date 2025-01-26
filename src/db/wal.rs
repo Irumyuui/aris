@@ -245,7 +245,7 @@ impl ReLogWriter {
     }
 }
 
-// TODO: If find a crc error, how to handle it?
+/// Re-Log Reader,
 pub struct ReLogReader {
     ring: rio::Rio,
 }
@@ -255,9 +255,19 @@ impl ReLogReader {
         Self { ring }
     }
 
-    pub async fn read(&self, path: impl AsRef<Path>) -> Result<Vec<Bytes>> {
-        let file = std::fs::OpenOptions::new().read(true).open(path)?;
-        let records = self.read_file(file).await?;
+    pub async fn read(&self, path: impl AsRef<Path>) -> Result<Vec<Bytes>, (Vec<Bytes>, Error)> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|e| (vec![], e.into()))?;
+        let mut err = None;
+        let records = match self.read_file(file).await {
+            Ok(v) => v,
+            Err((v, e)) => {
+                err = Some(e);
+                v
+            }
+        };
 
         let mut payloads = Vec::with_capacity(records.len());
         let mut buf = BytesMut::new();
@@ -282,11 +292,14 @@ impl ReLogReader {
             }
         }
 
-        Ok(payloads)
+        match err.take() {
+            None => Ok(payloads),
+            Some(e) => Err((payloads, e)),
+        }
     }
 
-    async fn read_file(&self, file: std::fs::File) -> Result<Vec<Record>> {
-        let file_len = file.metadata()?.len();
+    async fn read_file(&self, file: std::fs::File) -> Result<Vec<Record>, (Vec<Record>, Error)> {
+        let file_len = file.metadata().map_err(|e| (vec![], e.into()))?.len();
         let file = Arc::new(file);
 
         let blcok_count = (file_len + BLOCK_SIZE as u64) / BLOCK_SIZE as u64;
@@ -306,12 +319,21 @@ impl ReLogReader {
             tasks.push(task);
         }
 
-        let mut records = Vec::with_capacity(blcok_count as usize);
-        for task in tasks {
-            // TODO: if the file has some error, how to handle it?
-            // Now just return a err.
-            let res = task.await.unwrap()?;
-            records.extend(res.into_iter());
+        let mut results = Vec::with_capacity(blcok_count as usize);
+        for task in tasks.into_iter() {
+            let res = task.await.unwrap();
+            results.push(res);
+        }
+
+        let mut records = Vec::with_capacity(BLOCK_SIZE);
+        for res in results.into_iter() {
+            match res {
+                Ok(res) => records.extend(res.into_iter()),
+                Err((v, e)) => {
+                    records.extend(v.into_iter());
+                    return Err((records, e));
+                }
+            }
         }
 
         Ok(records)
@@ -322,11 +344,12 @@ impl ReLogReader {
         file: Arc<std::fs::File>,
         block_id: u64,
         block_remain: u64,
-    ) -> Result<Vec<Record>> {
+    ) -> Result<Vec<Record>, (Vec<Record>, Error)> {
         let mut buf = BytesMut::zeroed(block_remain as usize);
         let read_len = ring
             .read_at(&file, &mut buf, block_id * BLOCK_SIZE as u64)
-            .await?;
+            .await
+            .map_err(|e| (vec![], e.into()))?;
         assert_eq!(read_len, block_remain as usize);
 
         let buf = buf.freeze();
@@ -335,7 +358,7 @@ impl ReLogReader {
         Ok(records)
     }
 
-    fn get_records_from_block(block: Bytes) -> Result<Vec<Record>> {
+    fn get_records_from_block(block: Bytes) -> Result<Vec<Record>, (Vec<Record>, Error)> {
         let mut buf = &block[..];
 
         let mut records = Vec::with_capacity(10);
@@ -352,16 +375,21 @@ impl ReLogReader {
             let record_slice = &pref[..len as usize + 3];
             let calc_crc = crc32fast::hash(record_slice);
             if crc != calc_crc {
-                return Err(Error::ReLogReadCorrupted(format!(
-                    "crc not equal, expect: {}, calc: {}",
-                    crc, calc_crc,
-                )));
+                return Err((
+                    records,
+                    Error::ReLogReadCorrupted(format!(
+                        "crc not equal, expect: {}, calc: {}",
+                        crc, calc_crc,
+                    )),
+                ));
             }
 
-            let record = Record {
-                payload,
-                ty: RecordType::try_from(ty)?,
+            let ty = match RecordType::try_from(ty) {
+                Ok(t) => t,
+                Err(e) => return Err((records, e)),
             };
+
+            let record = Record { payload, ty };
             records.push(record);
         }
 
