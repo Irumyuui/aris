@@ -8,6 +8,9 @@ pub enum Error {
 
     #[error("Value Log File Corrupted: {0}")]
     ValueLogFileCorrupted(String),
+
+    #[error("Value Log File Creation Failed: {0}")]
+    ReLogFileCreatedFailed(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
