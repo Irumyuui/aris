@@ -245,6 +245,130 @@ impl ReLogWriter {
     }
 }
 
+// TODO: If find a crc error, how to handle it?
+pub struct ReLogReader {
+    ring: rio::Rio,
+}
+
+impl ReLogReader {
+    pub fn new(ring: rio::Rio) -> Self {
+        Self { ring }
+    }
+
+    pub async fn read(&self, path: impl AsRef<Path>) -> Result<Vec<Bytes>> {
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        let records = self.read_file(file).await?;
+
+        let mut payloads = Vec::with_capacity(records.len());
+        let mut buf = BytesMut::new();
+        for Record { payload, ty } in records.into_iter() {
+            match ty {
+                RecordType::First => {
+                    buf.clear();
+                    buf.extend_from_slice(&payload);
+                }
+                RecordType::Middle => {
+                    buf.extend_from_slice(&payload);
+                }
+                RecordType::Last => {
+                    buf.extend_from_slice(&payload);
+                    payloads.push(buf.clone().freeze());
+                    buf.clear();
+                }
+                RecordType::Full => {
+                    payloads.push(payload);
+                    buf.clear();
+                }
+            }
+        }
+
+        Ok(payloads)
+    }
+
+    async fn read_file(&self, file: std::fs::File) -> Result<Vec<Record>> {
+        let file_len = file.metadata()?.len();
+        let file = Arc::new(file);
+
+        let blcok_count = (file_len + BLOCK_SIZE as u64) / BLOCK_SIZE as u64;
+        let mut tasks = Vec::with_capacity(blcok_count as usize);
+        for i in 0..blcok_count {
+            let block_remain = if i == blcok_count - 1 {
+                file_len % BLOCK_SIZE as u64
+            } else {
+                BLOCK_SIZE as u64
+            };
+
+            let ring = self.ring.clone();
+            let file = file.clone();
+            let task =
+                tokio::spawn(async move { Self::read_block(ring, file, i, block_remain).await });
+
+            tasks.push(task);
+        }
+
+        let mut records = Vec::with_capacity(blcok_count as usize);
+        for task in tasks {
+            // TODO: if the file has some error, how to handle it?
+            // Now just return a err.
+            let res = task.await.unwrap()?;
+            records.extend(res.into_iter());
+        }
+
+        Ok(records)
+    }
+
+    async fn read_block(
+        ring: rio::Rio,
+        file: Arc<std::fs::File>,
+        block_id: u64,
+        block_remain: u64,
+    ) -> Result<Vec<Record>> {
+        let mut buf = BytesMut::zeroed(block_remain as usize);
+        let read_len = ring
+            .read_at(&file, &mut buf, block_id * BLOCK_SIZE as u64)
+            .await?;
+        assert_eq!(read_len, block_remain as usize);
+
+        let buf = buf.freeze();
+        let records = Self::get_records_from_block(buf)?;
+
+        Ok(records)
+    }
+
+    fn get_records_from_block(block: Bytes) -> Result<Vec<Record>> {
+        let mut buf = &block[..];
+
+        let mut records = Vec::with_capacity(10);
+        while buf.has_remaining() && buf.len() > 7 {
+            let pref = buf;
+
+            let len = buf.get_u16();
+            let ty = buf.get_u8();
+            let payload = block.slice_ref(&buf[..len as usize]);
+
+            buf = &buf[len as usize..];
+            let crc = buf.get_u32();
+
+            let record_slice = &pref[..len as usize + 3];
+            let calc_crc = crc32fast::hash(record_slice);
+            if crc != calc_crc {
+                return Err(Error::ReLogReadCorrupted(format!(
+                    "crc not equal, expect: {}, calc: {}",
+                    crc, calc_crc,
+                )));
+            }
+
+            let record = Record {
+                payload,
+                ty: RecordType::try_from(ty)?,
+            };
+            records.push(record);
+        }
+
+        Ok(records)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::{Buf, BufMut, Bytes, BytesMut};
