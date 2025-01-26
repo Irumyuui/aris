@@ -399,11 +399,7 @@ mod tests {
             ring: ring.clone(),
         };
 
-        println!("offsets: {:?}", offsets);
-
         for (i, offset) in offsets.iter().enumerate() {
-            println!("read order: {i}");
-
             let (record, next_offset) = reader.read_record(*offset).await?;
             assert_eq!(next_offset, *offset + record.encode().len() as u64);
 
