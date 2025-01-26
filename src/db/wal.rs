@@ -290,6 +290,15 @@ mod tests {
         payload.freeze()
     }
 
+    fn gen_writer(ring: rio::Rio, file: std::fs::File) -> ReLogWriter {
+        ReLogWriter {
+            ring,
+            file,
+            written_block_len: 0,
+            block_offset: 0,
+        }
+    }
+
     // expect write only one block.
     #[tokio::test]
     async fn write_in_one_block() -> anyhow::Result<()> {
@@ -298,12 +307,7 @@ mod tests {
 
         let payload = gen_payload(BLOCK_SIZE - 7);
 
-        let mut writer = ReLogWriter {
-            file: file.try_clone()?,
-            ring: ring.clone(),
-            written_block_len: 0,
-            block_offset: 0,
-        };
+        let mut writer = gen_writer(ring.clone(), file.try_clone()?);
         writer.write(payload.clone()).await?;
         writer.finish().await.expect("finish failed");
 
@@ -334,12 +338,8 @@ mod tests {
         // 4 blocks
         let payload = gen_payload((BLOCK_SIZE - 7) * 3 + BLOCK_SIZE / 2);
 
-        let mut writer = ReLogWriter {
-            file: file.try_clone()?,
-            ring: ring.clone(),
-            written_block_len: 0,
-            block_offset: 0,
-        };
+        let mut writer = gen_writer(ring.clone(), file.try_clone()?);
+
         writer.write(payload.clone()).await?;
         writer.finish().await.expect("finish failed");
 
@@ -391,12 +391,8 @@ mod tests {
         let file = tempfile()?;
 
         let payloads = vec![gen_payload(BLOCK_SIZE - 14), gen_payload(14)];
-        let mut writer = ReLogWriter {
-            file: file.try_clone()?,
-            ring: ring.clone(),
-            written_block_len: 0,
-            block_offset: 0,
-        };
+        let mut writer = gen_writer(ring.clone(), file.try_clone()?);
+
         for payload in &payloads {
             writer.write(payload.clone()).await?;
         }
@@ -435,12 +431,8 @@ mod tests {
         let file = tempfile()?;
 
         let payloads = vec![gen_payload(BLOCK_SIZE - 15), gen_payload(14)];
-        let mut writer = ReLogWriter {
-            file: file.try_clone()?,
-            ring: ring.clone(),
-            written_block_len: 0,
-            block_offset: 0,
-        };
+        let mut writer = gen_writer(ring.clone(), file.try_clone()?);
+
         for payload in &payloads {
             writer.write(payload.clone()).await?;
         }
