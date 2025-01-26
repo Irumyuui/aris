@@ -18,17 +18,12 @@ use crate::error::{Error, Result};
 ///
 /// A recovery file corresponds to a memtable.
 
-// const PADDING: &[u8] = &[0; 7];
-
+// Fuck lifetime
 const PADDING: [&[u8]; 7] = [
-    &[0],
-    &[0, 0],
-    &[0, 0, 0],
-    &[0, 0, 0, 0],
-    &[0, 0, 0, 0, 0],
-    &[0, 0, 0, 0, 0, 0],
-    &[0, 0, 0, 0, 0, 0, 0],
+    &[0; 1], &[0; 2], &[0; 3], &[0; 4], &[0; 5], &[0; 6], &[0; 7],
 ];
+
+/// The maximum size of a BLOCK.
 const BLOCK_SIZE: usize = 32 * 1024;
 
 #[repr(u8)]
@@ -909,5 +904,10 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn limit_block_size() {
+        assert!(BLOCK_SIZE <= u16::MAX as usize);
     }
 }
