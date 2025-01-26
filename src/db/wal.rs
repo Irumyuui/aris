@@ -1,6 +1,6 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use itertools::Itertools;
 
 use crate::error::{Error, Result};
@@ -34,11 +34,28 @@ const BLOCK_SIZE: usize = 8 * 1024 * 1024;
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
 enum RecordType {
-    None = 0, // Invalid record type.
+    // None = 0, // Invalid record type.
     First = 1,
     Middle = 2,
     Last = 3,
     Full = 4,
+}
+
+impl TryFrom<u8> for RecordType {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(RecordType::First),
+            2 => Ok(RecordType::Middle),
+            3 => Ok(RecordType::Last),
+            4 => Ok(RecordType::Full),
+            _ => Err(Error::ReLogReadCorrupted(format!(
+                "invalid record type: {}",
+                value
+            ))),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -224,15 +241,6 @@ impl ReLogWriter {
     }
 
     pub async fn finish(self) -> Result<(), (Self, Error)> {
-        if self.block_remain_bytes() != 0 && self.block_offset != 0 {
-            let buf = BytesMut::zeroed(self.block_remain_bytes() as usize).freeze();
-            let writted_bytes = self
-                .ring
-                .write_at(&self.file, &buf, self.last_file_offset())
-                .await
-                .map_err(|e| (self, e.into()))?;
-            assert_eq!(writted_bytes, buf.len());
-        }
         Ok(())
     }
 }
@@ -343,11 +351,14 @@ mod tests {
         writer.write(payload.clone()).await?;
         writer.finish().await.expect("finish failed");
 
-        assert_eq!(file.metadata()?.len(), BLOCK_SIZE as u64 * 4);
+        assert_eq!(
+            file.metadata()?.len(),
+            BLOCK_SIZE as u64 * 3 + BLOCK_SIZE as u64 / 2 + 7
+        );
 
-        let mut buf = BytesMut::zeroed(BLOCK_SIZE * 4);
+        let mut buf = BytesMut::zeroed(BLOCK_SIZE * 3 + BLOCK_SIZE / 2 + 7);
         let read_len = ring.read_at(&file, &mut buf, 0).await?;
-        assert_eq!(read_len, BLOCK_SIZE * 4);
+        assert_eq!(read_len, BLOCK_SIZE * 3 + BLOCK_SIZE / 2 + 7);
         let read_buf = buf.freeze();
 
         let mut records = Vec::with_capacity(4);
@@ -373,14 +384,14 @@ mod tests {
             records.push(record);
         }
 
-        let mut buf = BytesMut::zeroed(BLOCK_SIZE * 4);
+        let mut buf = BytesMut::zeroed(BLOCK_SIZE * 3 + BLOCK_SIZE / 2 + 7);
         let mut put_buf = &mut buf[..];
         for r in &records {
             put_buf.put(r.encord());
         }
 
         let target_buf = buf.freeze();
-        assert_eq!(read_buf, target_buf);
+        assert!(read_buf == target_buf);
 
         Ok(())
     }
@@ -398,10 +409,10 @@ mod tests {
         }
         writer.finish().await.expect("finish failed");
 
-        assert_eq!(file.metadata()?.len(), BLOCK_SIZE as u64 * 2);
-        let read_buf = BytesMut::zeroed(BLOCK_SIZE * 2);
+        assert_eq!(file.metadata()?.len(), BLOCK_SIZE as u64 + 21);
+        let read_buf = BytesMut::zeroed(BLOCK_SIZE + 21);
         let read_len = ring.read_at(&file, &read_buf, 0).await?;
-        assert_eq!(read_len, BLOCK_SIZE * 2);
+        assert_eq!(read_len, BLOCK_SIZE + 21);
         let read_buf = read_buf.freeze();
 
         let first_record = Record {
@@ -438,10 +449,10 @@ mod tests {
         }
         writer.finish().await.expect("finish failed");
 
-        assert_eq!(file.metadata()?.len(), BLOCK_SIZE as u64 * 2);
-        let read_buf = BytesMut::zeroed(BLOCK_SIZE * 2);
+        assert_eq!(file.metadata()?.len(), BLOCK_SIZE as u64 + 20);
+        let read_buf = BytesMut::zeroed(BLOCK_SIZE + 20);
         let read_len = ring.read_at(&file, &read_buf, 0).await?;
-        assert_eq!(read_len, BLOCK_SIZE * 2);
+        assert_eq!(read_len, BLOCK_SIZE + 20);
         let read_buf = read_buf.freeze();
 
         let first_record = Record {
