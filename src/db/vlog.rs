@@ -50,9 +50,9 @@ impl ValueLogRecord {
         let crc = crc32fast::hash(&buf[..]);
         buf.put_u32(crc);
 
-        tracing::debug!("key_len: {:?}, value_len: {:?}", key_len, value_len);
-        tracing::debug!("key: {:?}, value: {:?}", self.key, self.value);
-        tracing::debug!("crc32: {}", crc);
+        // tracing::debug!("key_len: {:?}, value_len: {:?}", key_len, value_len);
+        // tracing::debug!("key: {:?}, value: {:?}", self.key, self.value);
+        // tracing::debug!("crc32: {}", crc);
 
         buf.freeze()
     }
@@ -89,7 +89,7 @@ impl VLogOffsetReader {
         }
 
         let data_len = buf[0] as usize;
-        tracing::debug!("read_len: {} data_len: {}", read_len, data_len);
+        // tracing::debug!("read_len: {} data_len: {}", read_len, data_len);
 
         buf.resize(buf.len() + data_len, 0);
 
@@ -98,7 +98,7 @@ impl VLogOffsetReader {
         if key_value_len != data_len {
             return Err(Error::ValueLogFileCorrupted("Read data failed".into()));
         }
-        tracing::debug!("key_len + value_len: {}", key_value_len);
+        // tracing::debug!("key_len + value_len: {}", key_value_len);
 
         let var_key_len = VarUInt::try_from(&buf[1..])
             .map_err(|e| Error::ValueLogFileCorrupted(format!("Parse key len failed: {}", e)))?;
@@ -181,14 +181,14 @@ pub struct VLogWriter {
 
 impl VLogWriter {
     pub async fn write_record(&mut self, record: &ValueLogRecord) -> Result<()> {
-        tracing::debug!(
-            "write record: key {:?} value {:?}",
-            record.key,
-            record.value
-        );
+        // tracing::debug!(
+        //     "write record: key {:?} value {:?}",
+        //     record.key,
+        //     record.value
+        // );
 
         let encord = record.encode();
-        tracing::debug!("encord: {:?}", encord.len());
+        // tracing::debug!("encord: {:?}", encord.len());
 
         let offset = self.write_bytes;
 
@@ -210,7 +210,7 @@ impl VLogWriter {
     }
 
     pub async fn finish(self) -> Result<(), (Self, Error)> {
-        tracing::debug!("write tail, offsets: {:?}", self.offsets);
+        // tracing::debug!("write tail, offsets: {:?}", self.offsets);
 
         let mut buf = BytesMut::with_capacity(self.offsets.len() * 8 + 8 + 8 + 4 + 4);
 
@@ -246,7 +246,7 @@ impl VLogWriter {
                 )),
             )),
             Err(e) => {
-                tracing::error!("Write tail failed: {}", e);
+                // tracing::error!("Write tail failed: {}", e);
                 Err((self, e.into()))
             }
         }
@@ -255,9 +255,12 @@ impl VLogWriter {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use bytes::{Buf, BufMut, Bytes, BytesMut};
     use itertools::Itertools;
     use tempfile::tempfile;
+    use tokio::task::JoinSet;
 
     use crate::db::vlog::{VLogOffsetReader, VLogWriter};
 
@@ -349,10 +352,22 @@ mod tests {
 
     #[tokio::test]
     async fn write_some_record_and_finish() -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
+
         let ring = rio::new()?;
+
+        // let mut config = rio::Config::default();
+        // config.sq_poll = true;
+        // config.sq_poll_affinity = 10;
+
+        // let ring = config.start()?;
         let file = tempfile()?;
 
+        println!("create file: {:?}", start.elapsed());
+
         let records = (0..1000).map(gen_record).collect_vec();
+
+        println!("gen records: {:?}", start.elapsed());
 
         let mut writer = VLogWriter {
             ring: ring.clone(),
@@ -366,8 +381,12 @@ mod tests {
         }
         writer.finish().await.expect("write failed");
 
+        println!("write records: {:?}", start.elapsed());
+
         let file_len = file.metadata()?.len();
         assert!(file_len > 24);
+
+        println!("file len: {:?}", file_len);
 
         let mut tail = [0_u8; 24];
         let read_len = ring.read_at(&file, &mut tail, file_len - 24).await?;
@@ -380,9 +399,16 @@ mod tests {
         let marker = buf.get_u32();
         assert_eq!(marker, crate::db::vlog::MARKER);
 
+        println!(
+            "offset_start: {}, offset_count: {}",
+            offset_start, offset_count
+        );
+
         let mut offset_buf = vec![0_u8; (offset_count * 8) as usize];
         let read_len = ring.read_at(&file, &mut offset_buf, offset_start).await?;
         assert_eq!(read_len, offset_buf.len());
+
+        println!("read offsets: {:?}", start.elapsed());
 
         let mut offsets = Vec::with_capacity(offset_count as usize);
         let mut buf = offset_buf.as_slice();
@@ -390,22 +416,43 @@ mod tests {
             offsets.push(buf.get_u64());
         }
 
+        println!("parse offsets: {:?}", start.elapsed());
+
         offset_buf.extend_from_slice(&tail[..16]);
         let crc = crc32fast::hash(&offset_buf[..]);
         assert_eq!(crc, read_crc);
+
+        println!("crc check: {:?}", start.elapsed());
 
         let reader = VLogOffsetReader {
             file: file.try_clone()?,
             ring: ring.clone(),
         };
+        let reader = Arc::new(reader);
+
+        println!("create reader: {:?}", start.elapsed());
+
+        let mut tasks = JoinSet::new();
+        let records = Arc::new(records);
 
         for (i, offset) in offsets.iter().enumerate() {
-            let (record, next_offset) = reader.read_record(*offset).await?;
-            assert_eq!(next_offset, *offset + record.encode().len() as u64);
+            let i = i;
+            let offset = *offset;
+            let reader = reader.clone();
+            let records = records.clone();
 
-            let rec = records.get(i).expect("record not found");
-            assert_eq!(rec.key, record.key);
+            tasks.spawn(async move {
+                let (record, next_offset) = reader.read_record(offset).await.unwrap();
+                assert_eq!(next_offset, offset + record.encode().len() as u64);
+
+                let rec = records.get(i).expect("record not found");
+                assert_eq!(rec.key, record.key);
+            });
         }
+
+        tasks.join_all().await;
+
+        println!("read records: {:?}", start.elapsed());
 
         Ok(())
     }
