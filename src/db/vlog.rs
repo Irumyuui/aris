@@ -314,6 +314,27 @@ mod tests {
         ValueLogRecord::new(key, value)
     }
 
+    fn gen_big_record(id: usize) -> ValueLogRecord {
+        let key = Bytes::copy_from_slice(
+            format!(
+                "{}-{:05}",
+                String::from_utf8((0..1000000).map(|_| b'a').collect_vec()).unwrap(),
+                id
+            )
+            .as_bytes(),
+        );
+        let value = Bytes::copy_from_slice(
+            format!(
+                "{}-{:05}",
+                String::from_utf8((0..1000000).map(|_| b'b').collect_vec()).unwrap(),
+                id
+            )
+            .as_bytes(),
+        );
+
+        return ValueLogRecord::new(key, value);
+    }
+
     #[tokio::test]
     async fn read_some_record() -> anyhow::Result<()> {
         let ring = rio::new()?;
@@ -350,11 +371,14 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn write_some_record_and_finish() -> anyhow::Result<()> {
         let start = std::time::Instant::now();
 
-        let ring = rio::new()?;
+        let mut config = rio::Config::default();
+        config.depth = 4096;
+
+        let ring = config.start()?;
 
         // let mut config = rio::Config::default();
         // config.sq_poll = true;
@@ -365,7 +389,7 @@ mod tests {
 
         println!("create file: {:?}", start.elapsed());
 
-        let records = (0..1000).map(gen_record).collect_vec();
+        let records = (0..1000).map(gen_big_record).collect_vec();
 
         println!("gen records: {:?}", start.elapsed());
 
