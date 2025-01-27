@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicU64;
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::{Error, Result};
@@ -77,16 +79,125 @@ impl Entry {
     }
 }
 
-// pub struct ValuePointer {
-//     file_id: u32,
-//     oofset: u64,
-// }
+#[derive(Debug, Clone, Copy)]
+pub struct EntryPointer {
+    pub(crate) file_id: u32,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+}
+
+pub fn gen_vlog_file_path(file_id: u32) -> String {
+    format!("{:09}.vlog", file_id)
+}
+
+pub struct VLogWriter {
+    file: std::fs::File,
+    file_id: u32,
+    offset: u64,
+    ring: rio::Rio,
+}
+
+impl VLogWriter {
+    pub fn new(ring: rio::Rio, file_id: u32) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(false)
+            .write(true)
+            .create(true)
+            .open(gen_vlog_file_path(file_id))?;
+
+        Ok(Self {
+            file,
+            file_id,
+            offset: 0,
+            ring,
+        })
+    }
+
+    pub async fn write_entry(&mut self, entry: Entry) -> Result<EntryPointer> {
+        let buf = entry.encode();
+        let offset = self.offset;
+        let result = self
+            .ring
+            .write_at(&self.file, &buf.as_ref(), offset)
+            .await?;
+
+        if result != buf.len() {
+            return Err(Error::VLogFileCorrupted(format!(
+                "write size not match, expect: {}, actual: {}",
+                buf.len(),
+                result
+            )));
+        }
+
+        self.offset += buf.len() as u64;
+        Ok(EntryPointer {
+            file_id: self.file_id,
+            offset,
+            len: buf.len() as u64,
+        })
+    }
+}
+
+pub struct VLogReader {
+    // file: std::fs::File,
+    // file_id: u32,
+    ring: rio::Rio,
+}
+
+impl VLogReader {
+    pub fn new(ring: rio::Rio) -> std::io::Result<Self> {
+        Ok(Self { ring })
+    }
+
+    pub async fn read_entry(&self, pointer: EntryPointer) -> Result<Entry> {
+        let file = std::fs::OpenOptions::new()
+            .create(false)
+            .read(true)
+            .write(false)
+            .open(gen_vlog_file_path(pointer.file_id))?;
+
+        self.read_entry_from_file(&file, pointer.offset, pointer.len)
+            .await
+    }
+
+    async fn read_entry_from_file(
+        &self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Result<Entry> {
+        if len < 4 + ENTRY_HEADER_SIZE as u64 {
+            return Err(Error::VLogFileCorrupted("entry ptr too short".to_string()));
+        }
+
+        let mut buf = BytesMut::zeroed(len as usize);
+        let result = self.ring.read_at(file, &mut buf.as_mut(), offset).await?;
+
+        if result != buf.len() {
+            return Err(Error::VLogFileCorrupted(format!(
+                "read size not match, expect: {}, actual: {}",
+                buf.len(),
+                result
+            )));
+        }
+
+        let entry = Entry::decode(buf.freeze())?;
+        Ok(entry)
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use bytes::{Buf, BufMut, Bytes, BytesMut};
+    use std::sync::Arc;
 
-    use crate::vlog::ENTRY_HEADER_SIZE;
+    use bytes::{Buf, BufMut, Bytes, BytesMut};
+    use tempfile::tempfile;
+    use tokio::task::JoinSet;
+
+    use crate::{
+        utils::rio_config::RioConfigWrapper,
+        vlog::{gen_vlog_file_path, VLogReader, VLogWriter, ENTRY_HEADER_SIZE},
+    };
 
     use super::Entry;
 
@@ -131,6 +242,96 @@ mod tests {
         let buf = Bytes::copy_from_slice(b"keyvalue");
         let res = Entry::decode(buf);
         assert!(res.is_err());
+        Ok(())
+    }
+
+    fn gen_entries(count: usize) -> Vec<Entry> {
+        (0..count)
+            .map(|i| {
+                Entry::new(
+                    Bytes::from(format!("key-{i:05}")),
+                    Bytes::from(format!("value-{i:05}")),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn write_entry() -> anyhow::Result<()> {
+        let ring = RioConfigWrapper::new().depth(1024).build()?;
+        let file = tempfile()?;
+
+        let mut writer = VLogWriter {
+            ring: ring.clone(),
+            file_id: 0,
+            file: file.try_clone()?,
+            offset: 0,
+        };
+
+        let entries = gen_entries(100);
+        for e in &entries {
+            writer.write_entry(e.clone()).await?;
+        }
+        drop(writer);
+
+        let mut buf = BytesMut::new();
+        for e in &entries {
+            buf.extend(e.encode());
+        }
+        let buf = buf.freeze();
+
+        let file_len = file.metadata()?.len();
+        let read_buf = BytesMut::zeroed(file_len as _);
+
+        let read_len = ring.read_at(&file, &read_buf, 0).await?;
+        assert_eq!(read_len, file_len as usize);
+
+        assert_eq!(buf, read_buf.freeze());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_entry() -> anyhow::Result<()> {
+        let ring = RioConfigWrapper::new().depth(1024).build()?;
+        let file = tempfile()?;
+
+        let entries = gen_entries(100);
+        let mut write_buf = BytesMut::new();
+        let mut offsets = vec![];
+        for e in &entries {
+            let e = e.encode();
+            offsets.push(write_buf.len() as u64);
+            write_buf.extend(e);
+        }
+
+        let write_buf = write_buf.freeze();
+        let write_len = ring.write_at(&file, &write_buf, 0).await?;
+        assert_eq!(write_len, write_buf.len());
+
+        let mut tasks = JoinSet::new();
+        let file = Arc::new(file);
+        for (i, offset) in offsets.iter().enumerate() {
+            let reader = VLogReader::new(ring.clone())?;
+            let target = entries[i].clone();
+            let offset = *offset;
+            let file = file.clone();
+
+            tasks.spawn(async move {
+                let entry = reader
+                    .read_entry_from_file(
+                        file.as_ref(),
+                        offset,
+                        (ENTRY_HEADER_SIZE + target.key.len() + target.value.len() + 4) as u64,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(entry.key, target.key);
+                assert_eq!(entry.value, target.value);
+            });
+        }
+
+        tasks.join_all().await;
         Ok(())
     }
 }

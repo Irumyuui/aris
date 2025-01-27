@@ -5,6 +5,9 @@ pub enum Error {
 
     #[error("Vlog entry corrupted: {0}")]
     InvalidVlogEntry(String),
+
+    #[error("Vlog file corrupted: {0}")]
+    VLogFileCorrupted(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
