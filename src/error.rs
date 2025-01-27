@@ -1,3 +1,5 @@
+use std::alloc::LayoutError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("IO error: {0}")]
@@ -14,6 +16,12 @@ pub enum Error {
 
     #[error("ReLog File Corrupted: {0}")]
     ReLogReadCorrupted(String),
+
+    #[error("Layout Error: {0}")]
+    AlignedBlockNotAligned(LayoutError),
+
+    #[error("Memory Allocation Error: {0}")]
+    MemoryAlloc(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
