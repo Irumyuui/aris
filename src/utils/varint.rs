@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Display};
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 
 const MAX_VAR_UINT_SIZE: usize = 10;
 
@@ -65,6 +65,18 @@ impl VarUInt {
 
     pub(crate) fn as_bytes(&self) -> &Bytes {
         &self.bytes
+    }
+
+    pub(crate) fn extend_buf(buf: &mut impl BufMut, mut value: u64) -> usize {
+        let mut len = 0;
+        while value >= 0x80 {
+            buf.put_u8((value & 0x7F) as u8 | 0x80);
+            value >>= 7;
+            len += 1;
+        }
+        buf.put_u8(value as u8);
+        len += 1;
+        len
     }
 }
 
