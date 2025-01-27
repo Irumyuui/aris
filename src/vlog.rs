@@ -1,5 +1,3 @@
-use std::sync::atomic::AtomicU64;
-
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::{Error, Result};
@@ -196,7 +194,7 @@ mod tests {
 
     use crate::{
         utils::rio_config::RioConfigWrapper,
-        vlog::{gen_vlog_file_path, VLogReader, VLogWriter, ENTRY_HEADER_SIZE},
+        vlog::{VLogReader, VLogWriter, ENTRY_HEADER_SIZE},
     };
 
     use super::Entry;
