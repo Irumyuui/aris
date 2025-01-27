@@ -1,13 +1,5 @@
 use mimalloc::MiMalloc;
 
-mod memtable;
-mod sstable;
-
-mod db;
-mod utils;
-
-pub mod error;
-
 #[global_allocator]
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
