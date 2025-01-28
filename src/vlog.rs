@@ -1,4 +1,11 @@
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use regex::Regex;
 
 use crate::error::{Error, Result};
 
@@ -52,15 +59,30 @@ impl TryFrom<u8> for ValueType {
 /// and stored in the entry.
 ///
 #[derive(Debug, Clone)]
-pub struct Entry {
+pub struct VLogEntry {
     key: Bytes,
     value: Bytes,
     meta: ValueType, // reserve
 }
 
-impl Entry {
+impl VLogEntry {
     pub fn new(key: Bytes, value: Bytes, meta: ValueType) -> Self {
         Self { key, value, meta }
+    }
+
+    pub fn encode_for_buf(&self, buf: &mut BytesMut) -> usize {
+        // buf.put_u32(self.key.len() as u32);
+        // buf.put_u32(self.value.len() as u32);
+        // buf.put_u8(self.meta as u8);
+        // buf.put(self.key.as_ref());
+        // buf.put(self.value.as_ref());
+        // let crc = crc32fast::hash(buf.as_ref());
+        // buf.put_u32(crc);
+
+        let e = self.encode();
+        let res = e.len();
+        buf.extend(e);
+        res
     }
 
     pub fn encode(&self) -> Bytes {
@@ -99,138 +121,189 @@ impl Entry {
             return Err(Error::InvalidVlogEntry("crc not match".to_string()));
         }
 
-        Ok(Entry::new(key, value, value_type))
+        Ok(VLogEntry::new(key, value, value_type))
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct EntryPointer {
+pub struct ValuePointer {
     pub(crate) file_id: u32,
     pub(crate) offset: u64,
     pub(crate) len: u64,
 }
 
-pub fn gen_vlog_file_path(file_id: u32) -> String {
-    format!("{:09}.vlog", file_id)
+pub fn gen_vlog_file_path(path: &PathBuf, file_id: u32) -> PathBuf {
+    path.join(format!("{:09}.vlog", file_id))
 }
 
-pub struct VLogWriter {
-    file: std::fs::File,
-    file_id: u32,
-    offset: u64,
+pub struct VLogSet {
+    path: PathBuf,
+    vlog_files: BTreeMap<u32, std::path::PathBuf>,
+    max_fid: u32,
     ring: rio::Rio,
+    wirten_offset: u64,
+    max_file_size: u64,
+    current_file: Arc<std::fs::File>,
+    buf: BytesMut,
 }
 
-impl VLogWriter {
-    pub fn new(ring: rio::Rio, file_id: u32) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(false)
-            .write(true)
-            .create(true)
-            .open(gen_vlog_file_path(file_id))?;
+impl VLogSet {
+    pub async fn new(
+        ring: rio::Rio,
+        max_file_size: u64,
+        vlog_file_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
+        let mut vlog_files = read_vlog_dir(vlog_file_path.as_ref())?;
+        let path = PathBuf::from(vlog_file_path.as_ref());
 
+        let (file, offset) = match vlog_files.iter().max() {
+            Some((_, path)) => {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(false)
+                    .append(true)
+                    .open(path)?;
+                let offset = file.metadata()?.len();
+                (file, offset)
+            }
+            None => {
+                let filepath = gen_vlog_file_path(&path, 0);
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .append(true)
+                    .open(&filepath)?;
+                vlog_files.insert(0, filepath);
+                (file, 0)
+            }
+        };
+
+        let max_file_id = vlog_files.keys().max().copied().unwrap() + 1;
         Ok(Self {
-            file,
-            file_id,
-            offset: 0,
+            path,
+            vlog_files,
+            max_fid: max_file_id,
             ring,
+            wirten_offset: offset as u64,
+            max_file_size,
+            current_file: Arc::new(file),
+            buf: BytesMut::with_capacity(10000),
         })
     }
 
-    pub async fn write_entry(&mut self, entry: Entry) -> Result<EntryPointer> {
-        let buf = entry.encode();
-        let offset = self.offset;
-        let result = self
+    pub async fn append(&mut self, entries: &[VLogEntry]) -> Result<Vec<ValuePointer>> {
+        self.buf.clear();
+
+        let mut pointers = Vec::with_capacity(entries.len());
+        for e in entries {
+            let len = e.encode_for_buf(&mut self.buf);
+            let ptr = ValuePointer {
+                file_id: self.max_fid,
+                len: len as u64,
+                offset: self.wirten_offset + self.buf.len() as u64,
+            };
+            pointers.push(ptr);
+
+            if self.buf.len() as u64 + self.wirten_offset >= self.max_file_size {
+                self.write_buf_to_file().await?;
+            }
+        }
+
+        self.write_buf_to_file().await?;
+        Ok(pointers)
+    }
+
+    async fn write_buf_to_file(&mut self) -> Result<()> {
+        tracing::debug!("write buf to file, len: {}", self.buf.len());
+
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+
+        let res = self
             .ring
-            .write_at(&self.file, &buf.as_ref(), offset)
+            .write_at(self.current_file.as_ref(), &self.buf, self.wirten_offset)
             .await?;
+        assert_eq!(res, self.buf.len());
+        self.buf.clear();
 
-        if result != buf.len() {
-            return Err(Error::VLogFileCorrupted(format!(
-                "write size not match, expect: {}, actual: {}",
-                buf.len(),
-                result
-            )));
+        self.wirten_offset += res as u64;
+        if self.wirten_offset >= self.max_file_size {
+            let filepath = gen_vlog_file_path(&self.path, self.max_fid);
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .append(true)
+                .open(&filepath)?;
+            self.vlog_files.insert(self.max_fid, filepath);
+            self.current_file = Arc::new(file);
+            self.max_fid += 1;
+            self.wirten_offset = 0;
         }
 
-        self.offset += buf.len() as u64;
-        Ok(EntryPointer {
-            file_id: self.file_id,
-            offset,
-            len: buf.len() as u64,
-        })
+        Ok(())
     }
 }
 
-pub struct VLogReader {
-    // file: std::fs::File,
-    // file_id: u32,
-    ring: rio::Rio,
-}
-
-impl VLogReader {
-    pub fn new(ring: rio::Rio) -> std::io::Result<Self> {
-        Ok(Self { ring })
+fn read_vlog_dir(path: &Path) -> Result<BTreeMap<u32, PathBuf>> {
+    if !path.is_dir() {
+        return Err(Error::VLogFileCorrupted(format!(
+            "{:?} is not a directory, vlog path must be a directory",
+            path
+        )));
     }
 
-    pub async fn read_entry(&self, pointer: EntryPointer) -> Result<Entry> {
-        let file = std::fs::OpenOptions::new()
-            .create(false)
-            .read(true)
-            .write(false)
-            .open(gen_vlog_file_path(pointer.file_id))?;
-
-        self.read_entry_from_file(&file, pointer.offset, pointer.len)
-            .await
-    }
-
-    async fn read_entry_from_file(
-        &self,
-        file: &std::fs::File,
-        offset: u64,
-        len: u64,
-    ) -> Result<Entry> {
-        if len < 4 + ENTRY_HEADER_SIZE as u64 {
-            return Err(Error::VLogFileCorrupted("entry ptr too short".to_string()));
+    let re = Regex::new(r"^(\d+)\.vlog$").unwrap();
+    let mut vlog_files = BTreeMap::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let file_path = entry.path();
+        if !file_path.is_file() {
+            continue;
         }
 
-        let mut buf = BytesMut::zeroed(len as usize);
-        let result = self.ring.read_at(file, &mut buf.as_mut(), offset).await?;
+        if let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) {
+            if let Some(caps) = re.captures(file_name) {
+                let num_str = caps.get(1).unwrap().as_str();
 
-        if result != buf.len() {
-            return Err(Error::VLogFileCorrupted(format!(
-                "read size not match, expect: {}, actual: {}",
-                buf.len(),
-                result
-            )));
+                match num_str.parse::<u32>() {
+                    Ok(num) => {
+                        let res = vlog_files.insert(num, file_path.clone());
+                        assert!(res.is_none());
+                    }
+                    Err(_) => {
+                        continue;
+                    }
+                }
+            }
         }
-
-        let entry = Entry::decode(buf.freeze())?;
-        Ok(entry)
     }
+
+    Ok(vlog_files)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::path::PathBuf;
 
-    use bytes::{Buf, BufMut, Bytes, BytesMut};
-    use tempfile::tempfile;
-    use tokio::task::JoinSet;
-
+    use super::VLogEntry;
     use crate::{
         utils::rio_config::RioConfigWrapper,
-        vlog::{VLogReader, VLogWriter, ValueType, ENTRY_HEADER_SIZE},
+        vlog::{read_vlog_dir, VLogSet, ValueType, ENTRY_HEADER_SIZE},
     };
+    use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-    use super::Entry;
+    use scopeguard::defer;
 
     #[test]
     fn entry_encode_decode() -> anyhow::Result<()> {
         let key = Bytes::copy_from_slice(b"key");
         let value = Bytes::copy_from_slice(b"value");
 
-        let entry = Entry::new(key.clone(), value.clone(), ValueType::Value);
+        let entry = VLogEntry::new(key.clone(), value.clone(), ValueType::Value);
 
         let encode = entry.encode();
         assert_eq!(
@@ -256,7 +329,7 @@ mod tests {
         let calc_crc = crc32fast::hash(buf.as_ref());
         assert_eq!(crc, calc_crc);
 
-        let decode = Entry::decode(encode)?;
+        let decode = VLogEntry::decode(encode)?;
         assert_eq!(decode.key, key);
         assert_eq!(decode.value, value);
 
@@ -266,15 +339,15 @@ mod tests {
     #[test]
     fn entry_decode_failed() -> anyhow::Result<()> {
         let buf = Bytes::copy_from_slice(b"keyvalue");
-        let res = Entry::decode(buf);
+        let res = VLogEntry::decode(buf);
         assert!(res.is_err());
         Ok(())
     }
 
-    fn gen_entries(count: usize) -> Vec<Entry> {
+    fn gen_entries(count: usize) -> Vec<VLogEntry> {
         (0..count)
             .map(|i| {
-                Entry::new(
+                VLogEntry::new(
                     Bytes::from(format!("key-{i:05}")),
                     Bytes::from(format!("value-{i:05}")),
                     ValueType::Value,
@@ -284,81 +357,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_entry() -> anyhow::Result<()> {
+    async fn write_vlog() -> anyhow::Result<()> {
         let ring = RioConfigWrapper::new().depth(1024).build()?;
-        let file = tempfile()?;
 
-        let mut writer = VLogWriter {
-            ring: ring.clone(),
-            file_id: 0,
-            file: file.try_clone()?,
-            offset: 0,
-        };
-
-        let entries = gen_entries(100);
-        for e in &entries {
-            writer.write_entry(e.clone()).await?;
+        let vlog_path = PathBuf::from("temp_vlog");
+        std::fs::create_dir(&vlog_path)?;
+        defer! {
+            std::fs::remove_dir_all(&vlog_path).unwrap();
         }
-        drop(writer);
+
+        let mut vlog = VLogSet::new(ring.clone(), 66, &vlog_path).await?;
+        let entries = gen_entries(6);
+        vlog.append(&entries).await?;
 
         let mut buf = BytesMut::new();
-        for e in &entries {
-            buf.extend(e.encode());
-        }
-        let buf = buf.freeze();
+        entries.iter().for_each(|e| {
+            e.encode_for_buf(&mut buf);
+        });
+        let expected = buf.freeze();
 
-        let file_len = file.metadata()?.len();
-        let read_buf = BytesMut::zeroed(file_len as _);
+        let mut buf = BytesMut::new();
+        let file_set = read_vlog_dir(&vlog_path)?;
+        assert!(file_set.len() == 4);
 
-        let read_len = ring.read_at(&file, &read_buf, 0).await?;
-        assert_eq!(read_len, file_len as usize);
-
-        assert_eq!(buf, read_buf.freeze());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_entry() -> anyhow::Result<()> {
-        let ring = RioConfigWrapper::new().depth(1024).build()?;
-        let file = tempfile()?;
-
-        let entries = gen_entries(100);
-        let mut write_buf = BytesMut::new();
-        let mut offsets = vec![];
-        for e in &entries {
-            let e = e.encode();
-            offsets.push(write_buf.len() as u64);
-            write_buf.extend(e);
+        for (_, path) in file_set.iter() {
+            let content = std::fs::read(path)?;
+            buf.extend(content);
         }
 
-        let write_buf = write_buf.freeze();
-        let write_len = ring.write_at(&file, &write_buf, 0).await?;
-        assert_eq!(write_len, write_buf.len());
+        assert_eq!(buf, expected);
 
-        let mut tasks = JoinSet::new();
-        let file = Arc::new(file);
-        for (i, offset) in offsets.iter().enumerate() {
-            let reader = VLogReader::new(ring.clone())?;
-            let target = entries[i].clone();
-            let offset = *offset;
-            let file = file.clone();
-
-            tasks.spawn(async move {
-                let entry = reader
-                    .read_entry_from_file(
-                        file.as_ref(),
-                        offset,
-                        (ENTRY_HEADER_SIZE + target.key.len() + target.value.len() + 4) as u64,
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(entry.key, target.key);
-                assert_eq!(entry.value, target.value);
-            });
-        }
-
-        tasks.join_all().await;
         Ok(())
     }
 }

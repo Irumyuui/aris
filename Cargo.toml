@@ -33,6 +33,8 @@ fast-async-mutex = "0.6.7"
 crc32fast = "1.4.2"
 rio = "0.9.4"
 crossbeam-skiplist = "0.1.3"
+regex = "1.11.1"
+scopeguard = "1.2.0"
 
 [dev-dependencies]
 tempfile = "3.15.0"
