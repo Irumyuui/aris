@@ -2,7 +2,29 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::{Error, Result};
 
-const ENTRY_HEADER_SIZE: usize = 8;
+const ENTRY_HEADER_SIZE: usize = 8 + 1;
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy)]
+pub enum ValueType {
+    Delete = 0,
+    Value = 1,
+}
+
+impl TryFrom<u8> for ValueType {
+    type Error = Error;
+
+    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0 => Ok(ValueType::Delete),
+            1 => Ok(ValueType::Value),
+            _ => Err(Error::InvalidVlogEntry(format!(
+                "invalid value type: {}",
+                value
+            ))),
+        }
+    }
+}
 
 /// The entry for vlog file. It contains the key and value.
 ///
@@ -14,6 +36,8 @@ const ENTRY_HEADER_SIZE: usize = 8;
 /// ```text
 ///   +---------------------------------------+
 ///   | key len: 4 bytes | value len: 4 bytes |
+///   +---------------------------------------+
+///   |  entry meta: 1 bytes                  |
 ///   +---------------------------------------+
 ///   |  key bytes                            |
 ///   +---------------------------------------+
@@ -31,12 +55,12 @@ const ENTRY_HEADER_SIZE: usize = 8;
 pub struct Entry {
     key: Bytes,
     value: Bytes,
-    // meta: u32,  reserve
+    meta: ValueType, // reserve
 }
 
 impl Entry {
-    pub fn new(key: Bytes, value: Bytes) -> Self {
-        Self { key, value }
+    pub fn new(key: Bytes, value: Bytes, meta: ValueType) -> Self {
+        Self { key, value, meta }
     }
 
     pub fn encode(&self) -> Bytes {
@@ -44,6 +68,7 @@ impl Entry {
             BytesMut::with_capacity(ENTRY_HEADER_SIZE + self.key.len() + self.value.len() + 4);
         buf.put_u32(self.key.len() as u32);
         buf.put_u32(self.value.len() as u32);
+        buf.put_u8(self.meta as u8);
         buf.put(self.key.as_ref());
         buf.put(self.value.as_ref());
         let crc = crc32fast::hash(buf.as_ref());
@@ -62,6 +87,7 @@ impl Entry {
         if key_len + value_len + ENTRY_HEADER_SIZE + 4 > bytes.len() {
             return Err(Error::InvalidVlogEntry("buf length not match".to_string()));
         }
+        let value_type = ValueType::try_from(ptr.get_u8())?;
 
         let key = bytes.slice(ENTRY_HEADER_SIZE..ENTRY_HEADER_SIZE + key_len);
         let value =
@@ -73,7 +99,7 @@ impl Entry {
             return Err(Error::InvalidVlogEntry("crc not match".to_string()));
         }
 
-        Ok(Self { key, value })
+        Ok(Entry::new(key, value, value_type))
     }
 }
 
@@ -194,7 +220,7 @@ mod tests {
 
     use crate::{
         utils::rio_config::RioConfigWrapper,
-        vlog::{VLogReader, VLogWriter, ENTRY_HEADER_SIZE},
+        vlog::{VLogReader, VLogWriter, ValueType, ENTRY_HEADER_SIZE},
     };
 
     use super::Entry;
@@ -204,7 +230,7 @@ mod tests {
         let key = Bytes::copy_from_slice(b"key");
         let value = Bytes::copy_from_slice(b"value");
 
-        let entry = Entry::new(key.clone(), value.clone());
+        let entry = Entry::new(key.clone(), value.clone(), ValueType::Value);
 
         let encode = entry.encode();
         assert_eq!(
@@ -214,6 +240,7 @@ mod tests {
         let mut ptr = &encode[..];
         assert_eq!(ptr.get_u32(), key.len() as u32);
         assert_eq!(ptr.get_u32(), value.len() as u32);
+        assert_eq!(ptr.get_u8(), ValueType::Value as u8);
         assert_eq!(&ptr[..key.len()], key.as_ref());
         let ptr = &ptr[key.len()..];
         assert_eq!(&ptr[..value.len()], value.as_ref());
@@ -223,6 +250,7 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_u32(key.len() as u32);
         buf.put_u32(value.len() as u32);
+        buf.put_u8(ValueType::Value as u8);
         buf.put(key.as_ref());
         buf.put(value.as_ref());
         let calc_crc = crc32fast::hash(buf.as_ref());
@@ -249,6 +277,7 @@ mod tests {
                 Entry::new(
                     Bytes::from(format!("key-{i:05}")),
                     Bytes::from(format!("value-{i:05}")),
+                    ValueType::Value,
                 )
             })
             .collect()
