@@ -2,6 +2,9 @@ pub mod error;
 pub mod utils;
 pub mod vlog;
 
+pub mod write_batch;
+mod memtable;
+
 use mimalloc::MiMalloc;
 
 #[global_allocator]
