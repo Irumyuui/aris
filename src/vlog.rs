@@ -138,7 +138,7 @@ pub fn gen_vlog_file_path(path: &PathBuf, file_id: u32) -> PathBuf {
 
 pub struct VLogSet {
     path: PathBuf,
-    vlog_files: BTreeMap<u32, std::path::PathBuf>,
+    vlog_files: BTreeMap<u32, Arc<std::path::PathBuf>>,
     max_fid: u32,
     ring: rio::Rio,
     wirten_offset: u64,
@@ -163,7 +163,7 @@ impl VLogSet {
                     .write(true)
                     .create(false)
                     .append(true)
-                    .open(path)?;
+                    .open(path.as_ref())?;
                 let offset = file.metadata()?.len();
                 (file, offset)
             }
@@ -175,7 +175,7 @@ impl VLogSet {
                     .create(true)
                     .append(true)
                     .open(&filepath)?;
-                vlog_files.insert(0, filepath);
+                vlog_files.insert(0, Arc::new(filepath));
                 (file, 0)
             }
         };
@@ -238,7 +238,7 @@ impl VLogSet {
                 .create(true)
                 .append(true)
                 .open(&filepath)?;
-            self.vlog_files.insert(self.max_fid, filepath);
+            self.vlog_files.insert(self.max_fid, Arc::new(filepath));
             self.current_file = Arc::new(file);
             self.max_fid += 1;
             self.wirten_offset = 0;
@@ -248,7 +248,7 @@ impl VLogSet {
     }
 }
 
-fn read_vlog_dir(path: &Path) -> Result<BTreeMap<u32, PathBuf>> {
+fn read_vlog_dir(path: &Path) -> Result<BTreeMap<u32, Arc<PathBuf>>> {
     if !path.is_dir() {
         return Err(Error::VLogFileCorrupted(format!(
             "{:?} is not a directory, vlog path must be a directory",
@@ -271,7 +271,7 @@ fn read_vlog_dir(path: &Path) -> Result<BTreeMap<u32, PathBuf>> {
 
                 match num_str.parse::<u32>() {
                     Ok(num) => {
-                        let res = vlog_files.insert(num, file_path.clone());
+                        let res = vlog_files.insert(num, Arc::new(file_path.clone()));
                         assert!(res.is_none());
                     }
                     Err(_) => {
@@ -381,7 +381,7 @@ mod tests {
         assert!(file_set.len() == 4);
 
         for (_, path) in file_set.iter() {
-            let content = std::fs::read(path)?;
+            let content = std::fs::read(path.as_ref())?;
             buf.extend(content);
         }
 

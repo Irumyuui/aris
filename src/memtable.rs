@@ -1,7 +1,7 @@
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use bytes::{BufMut, Bytes, BytesMut};
-use crossbeam_skiplist::{SkipMap, SkipSet};
+use crossbeam_skiplist::SkipMap;
 
 use crate::{vlog::ValuePointer, write_batch::WriteType};
 
@@ -30,8 +30,8 @@ impl MemTable {
     }
 
     #[inline]
-    pub fn get(&self, seq: u64, key: Bytes) -> Option<ValuePointer> {
-        self.inner.get(seq, key)
+    pub fn get(&self, key: &LookupKey) -> Option<ValuePointer> {
+        self.inner.get(key)
     }
 }
 
@@ -76,11 +76,8 @@ impl MemTableInner {
     ///
     /// ```
     fn add(&self, seq: u64, ty: WriteType, key: Bytes, value_ptr: ValuePointer) {
-        let mut buf = BytesMut::with_capacity(key.len() + 7 + 1);
-        buf.extend(key);
-        buf.put_u64(seq);
-        buf.put_u8(ty as u8);
-        let buf = buf.freeze();
+        let LookupKey { bytes } = LookupKey::new(key, seq);
+        let buf = bytes;
 
         let mem_use = buf.len() + 12;
         self.table.insert(buf, value_ptr);
@@ -88,16 +85,27 @@ impl MemTableInner {
             .fetch_add(mem_use, std::sync::atomic::Ordering::Release);
     }
 
-    fn get(&self, seq: u64, key: Bytes) -> Option<ValuePointer> {
+    fn get(&self, key: &LookupKey) -> Option<ValuePointer> {
+        match self.table.get(&key.bytes) {
+            Some(e) => Some(e.value().clone()),
+            None => None,
+        }
+    }
+}
+
+pub struct LookupKey {
+    bytes: Bytes,
+}
+
+impl LookupKey {
+    pub fn new(key: Bytes, seq: u64) -> Self {
         let mut buf = BytesMut::with_capacity(key.len() + 7 + 1);
         buf.extend(key);
         buf.put_u64(seq);
         buf.put_u8(WriteType::Value as u8);
 
-        let buf = buf.freeze();
-        match self.table.get(&buf) {
-            Some(e) => Some(e.value().clone()),
-            None => None,
+        Self {
+            bytes: buf.freeze(),
         }
     }
 }

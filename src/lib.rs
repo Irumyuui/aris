@@ -4,6 +4,9 @@ pub mod vlog;
 
 pub mod write_batch;
 mod memtable;
+mod db_impl;
+
+pub mod options;
 
 use mimalloc::MiMalloc;
 
