@@ -1,4 +1,5 @@
 mod vlog;
+mod utils;
 
 use mimalloc::MiMalloc;
 

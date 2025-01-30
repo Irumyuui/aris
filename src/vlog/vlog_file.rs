@@ -59,7 +59,7 @@ impl VLogFile {
     }
 
     pub(crate) async fn read(&self, ptr: &ValuePointer) -> anyhow::Result<BytesMut> {
-        let mut buf = BytesMut::with_capacity(ptr.len as usize);
+        let mut buf = BytesMut::zeroed(ptr.len as usize);
         let offset = ptr.offset;
         let read_bytes = self
             .ring
@@ -74,7 +74,7 @@ impl VLogFile {
         buf: &[u8],
         offset: u64,
     ) -> anyhow::Result<(ValuePointer, usize)> {
-        ensure!(self._read_only);
+        tracing::debug!("write to file: {:?}", self.path);
 
         let ptr = ValuePointer {
             file_id: self.file_id,

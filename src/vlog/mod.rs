@@ -150,7 +150,9 @@ impl ValueLogSet {
     }
 
     pub async fn read_entry(&self, ptr: &ValuePointer) -> anyhow::Result<VLogEntry> {
+        tracing::debug!("Read entry ptr: {:?}", ptr);
         let buf = self.read_inner(ptr).await?;
+        tracing::debug!("Read entry buf: {:?}", buf);
         VLogEntry::decode(buf.freeze())
     }
 
@@ -225,15 +227,15 @@ impl LogFiles {
                 active_files.insert(fid.clone(), file);
 
                 let new_file_path = path.join(gen_file_name(max_fid));
-                max_fid += 1;
                 current_file = WriteLogFile::new(ring.clone(), new_file_path, max_fid)?;
+                max_fid += 1;
             } else {
                 current_file = file;
             }
         } else {
             let new_file_path = path.join(gen_file_name(max_fid));
-            max_fid += 1;
             current_file = WriteLogFile::new(ring.clone(), new_file_path, max_fid)?;
+            max_fid += 1;
         }
 
         let deleted_files = BTreeSet::new();
@@ -247,6 +249,13 @@ impl LogFiles {
             deleted_files,
             ring,
         };
+
+        tracing::debug!(
+            "Create state, max fid: {}, max file size: {}, current_file: {}",
+            this.max_fid,
+            this.max_file_size,
+            this.current_file.fid()
+        );
         Ok(this)
     }
 
@@ -261,30 +270,47 @@ impl LogFiles {
             return Ok(());
         }
 
+        tracing::debug!(
+            "Next vlog file, current file size: {}",
+            self.current_file.writen_len()
+        );
+
         let new_file = WriteLogFile::new(
             self.ring.clone(),
             self.path.join(gen_file_name(self.max_fid)),
             self.max_fid,
         )?;
+        tracing::debug!("New vlog file: {:?}", new_file.fid());
 
         let old_file = std::mem::replace(&mut self.current_file, new_file).into_read();
         self.active_files.insert(old_file.fid(), old_file);
+        self.max_fid += 1;
+        tracing::debug!("Max fid: {}", self.max_fid);
         Ok(())
     }
 
     async fn read(&self, ptr: &ValuePointer) -> anyhow::Result<BytesMut> {
         if let Some(file) = self.active_files.get(&ptr.file_id) {
+            tracing::debug!("Read from active file: {:?}", file.fid());
             return file.read(ptr).await;
         }
+
+        tracing::debug!("Read from current file: {:?}", self.current_file.fid());
         self.current_file.read(ptr).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use bytes::{Buf, BufMut, Bytes, BytesMut};
+    use std::path::PathBuf;
 
-    use crate::vlog::{VLogEntry, ValueType, ENTRY_HEADER_SIZE};
+    use bytes::{Buf, BufMut, Bytes, BytesMut};
+    use itertools::Itertools;
+
+    use crate::{
+        utils::rio_config::RioConfigWrapper,
+        vlog::{gen_file_name, VLogEntry, ValueLogSet, ValuePointer, ValueType, ENTRY_HEADER_SIZE},
+    };
 
     #[test]
     fn entry_encode_decode() -> anyhow::Result<()> {
@@ -329,6 +355,117 @@ mod tests {
         let buf = Bytes::copy_from_slice(b"keyvalue");
         let res = VLogEntry::decode(buf);
         assert!(res.is_err());
+        Ok(())
+    }
+
+    fn gen_entries(count: usize) -> Vec<VLogEntry> {
+        (0..count)
+            .map(|i| VLogEntry {
+                key: Bytes::copy_from_slice(format!("key-{:05}", i).as_bytes()),
+                value: Bytes::copy_from_slice(format!("value-{:05}", i).as_bytes()),
+                meta: ValueType::Value,
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_entries() -> anyhow::Result<()> {
+        const TEST_COUNT: usize = 700;
+        const SPLIT_COUNT: usize = 3;
+
+        let ring = RioConfigWrapper::new().depth(4096).build()?;
+        let path = PathBuf::from("temp_vlog_write_entries");
+        scopeguard::defer! {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+
+        let entries = gen_entries(TEST_COUNT);
+        let encodes = entries.iter().map(|e| e.encode()).collect_vec();
+        let total_len = encodes.iter().map(|e| e.len()).sum::<usize>();
+        let file_len_limit = total_len / SPLIT_COUNT;
+
+        let vlog = ValueLogSet::new(ring.clone(), &path, file_len_limit as _)?;
+
+        let mut ptrs = Vec::with_capacity(TEST_COUNT);
+        for e in entries.iter() {
+            let ptr = vlog.write_entry(e).await?;
+            ptrs.push(ptr);
+        }
+        drop(vlog);
+
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let file_path = path.join(gen_file_name(ptr.file_id));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(false)
+                .create(false)
+                .open(file_path)?;
+            let buf = BytesMut::zeroed(ptr.len as usize);
+            let read_bytes = ring.read_at(&file, &buf, ptr.offset).await?;
+            assert_eq!(read_bytes, ptr.len as usize);
+
+            let buf = buf.freeze();
+
+            assert_eq!(buf, encodes[i], "i: {}", i);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_entries() -> anyhow::Result<()> {
+        const TEST_COUNT: usize = 700;
+        const SPLIT_COUNT: usize = 3;
+
+        let ring = RioConfigWrapper::new().depth(4096).build()?;
+        let path = PathBuf::from("temp_vlog_read_entries");
+
+        std::fs::create_dir(&path)?;
+        scopeguard::defer! {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+
+        let entries = gen_entries(TEST_COUNT);
+        let encodes = entries.iter().map(|e| e.encode()).collect_vec();
+        let total_len = encodes.iter().map(|e| e.len()).sum::<usize>();
+        let file_len_limit = total_len / SPLIT_COUNT;
+
+        let mut offset = 0;
+        let mut file_id = 0;
+        let mut ptrs = Vec::new();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(path.join(gen_file_name(file_id)))?;
+        for (_i, e) in encodes.iter().enumerate() {
+            let write_len = ring.write_at(&file, &e, offset).await?;
+            assert_eq!(write_len, e.len());
+            ptrs.push(ValuePointer {
+                file_id,
+                len: e.len() as u32,
+                offset,
+            });
+            offset += e.len() as u64;
+            if offset >= file_len_limit as u64 {
+                file_id += 1;
+                offset = 0;
+                file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .read(true)
+                    .open(path.join(gen_file_name(file_id)))?;
+            }
+        }
+        drop(file);
+
+        let vlog = ValueLogSet::new(ring.clone(), &path, file_len_limit as u64)?;
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let entry = vlog.read_entry(ptr).await?;
+            let encode = entry.encode();
+            assert_eq!(encode, encodes[i]);
+        }
+
         Ok(())
     }
 }
