@@ -1,3 +1,6 @@
+// TODO: REMOVE IT
+#![allow(unused)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -22,6 +25,7 @@ pub enum ValueType {
     BatchBegin = 2,
     BatchMid = 3,
     BatchEnd = 4,
+    Head = 5,
 }
 
 impl TryFrom<u8> for ValueType {
@@ -34,6 +38,7 @@ impl TryFrom<u8> for ValueType {
             2 => Ok(ValueType::BatchBegin),
             3 => Ok(ValueType::BatchMid),
             4 => Ok(ValueType::BatchEnd),
+            5 => Ok(ValueType::Head),
             _ => Err(anyhow::anyhow!("invalid value type")),
         }
     }
@@ -121,11 +126,43 @@ impl VLogEntry {
 
 /* #endregion entry */
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ValuePointer {
     pub(crate) file_id: u32,
     pub(crate) len: u32,
     pub(crate) offset: u64,
+}
+
+impl ValuePointer {
+    pub(crate) const ENCODE_SIZE: usize = 4 + 4 + 8;
+
+    pub(crate) fn encode(&self) -> [u8; Self::ENCODE_SIZE] {
+        let mut res = [0u8; Self::ENCODE_SIZE];
+        let mut buf = &mut res[..];
+
+        buf.put_u32(self.file_id);
+        buf.put_u32(self.len);
+        buf.put_u64(self.offset);
+
+        res
+    }
+
+    pub(crate) fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() != Self::ENCODE_SIZE {
+            return None;
+        }
+
+        let mut buf = buf;
+        let file_id = buf.get_u32();
+        let len = buf.get_u32();
+        let offset = buf.get_u64();
+
+        Some(Self {
+            file_id,
+            len,
+            offset,
+        })
+    }
 }
 
 pub struct ValueLogSet {
