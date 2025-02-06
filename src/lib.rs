@@ -1,7 +1,9 @@
-mod utils;
-mod vlog;
+pub(crate) mod mem;
+pub(crate) mod utils;
+pub(crate) mod redo_log;
 
-mod mem;
+pub mod iterator;
+pub mod error;
 
 use mimalloc::MiMalloc;
 
@@ -9,9 +11,7 @@ use mimalloc::MiMalloc;
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
 #[ctor::ctor]
-fn init() {
-    color_backtrace::install();
-
+fn __init() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_target(true)
