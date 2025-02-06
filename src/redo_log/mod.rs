@@ -27,14 +27,15 @@
 ///     +---------------+
 /// ```
 ///
-/// Header format:
+/// Record format:
 ///
 /// ```text
-///     +---------------------------------+
-///     | crc32 4b | data len 2b | ty: 1b |
-///     +---------------------------------+
+///     +----------------------------------------+
+///     | data len 2b | ty: 1b | data | crc32 4b |
+///     +----------------------------------------+
 /// ```
 pub mod reader;
+pub mod writer;
 
 pub const HEADER_SIZE: usize = 7;
 pub const BLOCK_SIZE: usize = 32 * 1024;
