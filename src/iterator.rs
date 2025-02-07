@@ -1,7 +1,9 @@
 use crate::error::DBResult;
 
 pub trait Iterator {
-    type PeekItem;
+    // type PeekItem;
+    // type KeyItem;
+    // type ValueItem;
 
     fn is_valid(&self) -> bool;
 
@@ -9,7 +11,11 @@ pub trait Iterator {
 
     fn prev(&mut self);
 
-    fn peek(&self) -> Option<&Self::PeekItem>;
+    // fn peek(&self) -> Option<&Self::PeekItem>;
+
+    fn key(&self) -> &[u8];
+
+    fn value(&self) -> &[u8];
 
     fn seek_to_first(&mut self);
 

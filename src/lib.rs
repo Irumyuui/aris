@@ -1,7 +1,10 @@
 pub(crate) mod mem;
 pub(crate) mod utils;
 pub(crate) mod redo_log;
+pub(crate) mod table;
+pub(crate) mod config;
 
+pub mod comparator;
 pub mod iterator;
 pub mod error;
 
