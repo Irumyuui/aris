@@ -8,7 +8,7 @@ pub trait VarInt: Sized {
 
     fn put_varint(&self, buf: impl BufMut) -> usize;
 
-    fn from_varint(buf: &[u8]) -> DBResult<Self, VarIntError>;
+    fn from_varint(buf: &[u8]) -> DBResult<(Self, usize), VarIntError>;
 }
 
 impl VarInt for u64 {
@@ -32,9 +32,11 @@ impl VarInt for u64 {
         len
     }
 
-    fn from_varint(buf: &[u8]) -> DBResult<Self, VarIntError> {
+    fn from_varint(buf: &[u8]) -> DBResult<(Self, usize), VarIntError> {
         let mut n = 0u64;
         let mut shift = 0;
+
+        let mut i = 0;
         for &byte in buf {
             if shift >= 64 {
                 return Err(VarIntError::Overflow);
@@ -42,8 +44,9 @@ impl VarInt for u64 {
 
             n |= ((byte & 0x7F) as u64) << shift;
             shift += 7;
+            i += 1;
             if byte & 0x80 == 0 {
-                return Ok(n);
+                return Ok((n, i));
             }
         }
 
@@ -81,9 +84,10 @@ impl VarInt for u32 {
         n.put_varint(buf)
     }
 
-    fn from_varint(buf: &[u8]) -> DBResult<Self, VarIntError> {
-        let n = u64::from_varint(buf)?;
-        u32::try_from(n).map_err(|_| VarIntError::Overflow)
+    fn from_varint(buf: &[u8]) -> DBResult<(Self, usize), VarIntError> {
+        let (n, len) = u64::from_varint(buf)?;
+        let n = u32::try_from(n).map_err(|_| VarIntError::Overflow)?;
+        Ok((n, len))
     }
 }
 
@@ -117,7 +121,7 @@ mod tests {
             let _varint = VarInt::put_varint(&value, &mut buf);
             let buf = buf.freeze();
             assert_eq!(buf, expected);
-            let res: u32 = VarInt::from_varint(&buf).unwrap();
+            let res: u32 = VarInt::from_varint(&buf).unwrap().0;
             assert_eq!(res, res);
         }
     }
@@ -128,7 +132,7 @@ mod tests {
         let cases = 0xFFFFFFFFFF_u64;
         let mut buf = vec![];
         let _ = VarInt::put_varint(&cases, &mut buf);
-        let _res: u32 = VarInt::from_varint(&buf).unwrap();
+        let _res: u32 = VarInt::from_varint(&buf).unwrap().0;
     }
 
     #[test]
@@ -161,7 +165,7 @@ mod tests {
             let _varint = VarInt::put_varint(value, &mut buf);
             let buf = buf.freeze();
             assert_eq!(buf, *expected);
-            let res: u64 = VarInt::from_varint(&buf).unwrap();
+            let res: u64 = VarInt::from_varint(&buf).unwrap().0;
             assert_eq!(res, *value);
         }
     }
@@ -173,7 +177,7 @@ mod tests {
         ][..];
         let excepted = u64::MAX;
 
-        let res: u64 = VarInt::from_varint(slice).unwrap();
+        let res: u64 = VarInt::from_varint(slice).unwrap().0;
         assert_eq!(res, excepted);
     }
 }
