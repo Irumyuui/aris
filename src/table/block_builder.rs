@@ -136,7 +136,7 @@ mod tests {
 
         let config = Config {
             block_restart_interval: 3,
-            comparator: Box::new(TestComparator),
+            comparator: Arc::new(TestComparator),
         };
         let config = Arc::new(config);
         let mut builder = BlockBuilder::new(config);
