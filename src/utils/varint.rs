@@ -6,7 +6,7 @@ pub trait VarInt: Sized {
     // return length of the varint
     fn encode_varint(&self, buf: impl AsMut<[u8]>) -> usize;
 
-    fn put_varint(&self, buf: impl BufMut) -> usize;
+    fn put_varint(&self, buf: &mut impl BufMut) -> usize;
 
     fn from_varint(buf: &[u8]) -> DBResult<(Self, usize), VarIntError>;
 }
@@ -53,7 +53,7 @@ impl VarInt for u64 {
         Err(VarIntError::InsufficientBytes)
     }
 
-    fn put_varint(&self, mut buf: impl BufMut) -> usize {
+    fn put_varint(&self, buf: &mut impl BufMut) -> usize {
         let mut n: u64 = (*self).into();
 
         let mut len = 0;
@@ -79,7 +79,7 @@ impl VarInt for u32 {
         n.encode_varint(buf)
     }
 
-    fn put_varint(&self, buf: impl BufMut) -> usize {
+    fn put_varint(&self, buf: &mut impl BufMut) -> usize {
         let n: u64 = (*self).into();
         n.put_varint(buf)
     }

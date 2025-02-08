@@ -108,13 +108,17 @@ impl BlockBuilder {
         self.restarts.push(0);
         self.last_key.clear();
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, vec};
 
-    use crate::{comparator::Comparator, config::Config};
+    use crate::{comparator::Comparator, config::ConfigBuilder};
 
     use super::BlockBuilder;
 
@@ -128,17 +132,24 @@ mod tests {
         fn name(&self) -> &str {
             unreachable!();
         }
+
+        fn find_shortest_separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
+            unimplemented!()
+        }
+
+        fn find_short_successor(&self, key: &[u8]) -> Vec<u8> {
+            unimplemented!()
+        }
     }
 
     #[test]
     fn build_new_block() {
         let inputs = vec!["a", "ab", "abc", "acd", "adc", "bcd", "bde", "eee"];
 
-        let config = Config {
-            block_restart_interval: 3,
-            comparator: Arc::new(TestComparator),
-        };
-        let config = Arc::new(config);
+        let config = ConfigBuilder::default()
+            .block_restart_interval(3)
+            .comparator(Arc::new(TestComparator))
+            .build();
         let mut builder = BlockBuilder::new(config);
 
         for input in inputs.iter() {
